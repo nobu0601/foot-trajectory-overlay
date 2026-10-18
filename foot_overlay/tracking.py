@@ -22,12 +22,34 @@ class TrackPoint:
     y: float
 
 
+SPLIT_ID_BASE = 100000  # 画面外から戻ってきた人に解析中だけ振る仮IDの始まり（最後に通し番号へ振り直す）
+
+
 @dataclass
 class TrackingResult:
     first_frame: np.ndarray
     fps: float
     total_frames: int
     tracks: dict[int, list[TrackPoint]] = field(default_factory=dict)
+    # 追跡器のID → いま記録中の線のID（画面外に出て戻ってきたら新しい線にする）
+    _current_id: dict[int, int] = field(default_factory=dict)
+    _left_frame: set[int] = field(default_factory=set)
+    _next_split_id: int = SPLIT_ID_BASE
+
+
+def edge_margin(width: int, height: int) -> float:
+    """足元が画面の縁からこの距離以内なら「画面外」とみなす。"""
+    return max(2.0, 0.005 * max(width, height))
+
+
+def foot_outside_frame(x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> bool:
+    """検出枠が画面の下端・左右の端で切れていて、足元が画面外にあるか。
+
+    枠が縁で切れていると「枠の下辺の中央」は本当の足元ではなく画面の縁になるため、
+    そのまま記録すると追跡線が画面の辺に沿って描かれてしまう。
+    """
+    m = edge_margin(width, height)
+    return y2 >= height - 1 - m or x1 <= m or x2 >= width - 1 - m
 
 
 def open_video(path: Path) -> tuple[cv2.VideoCapture, Path | None]:
@@ -128,6 +150,7 @@ def track_video(
                 break
 
         result.total_frames = frame_idx
+        result.tracks = _renumber_split_ids(result.tracks)
         if progress is not None:
             progress(frame_idx, frame_idx, len(result.tracks))
         return result
@@ -137,7 +160,7 @@ def track_video(
             shutil.rmtree(tmp_path.parent, ignore_errors=True)
 
 
-def _track_one_frame(model, frame, frame_idx, result, conf, imgsz, tracker, device) -> None:
+def _track_one_frame(model, frame, frame_idx, result: TrackingResult, conf, imgsz, tracker, device) -> None:
     outputs = model.track(
         frame,
         persist=True,  # フレーム間でIDを引き継ぐ
@@ -151,7 +174,59 @@ def _track_one_frame(model, frame, frame_idx, result, conf, imgsz, tracker, devi
     boxes = outputs[0].boxes
     if boxes is None or boxes.id is None:
         return
+    h, w = frame.shape[:2]
     ids = boxes.id.int().tolist()
     for track_id, (x1, y1, x2, y2) in zip(ids, boxes.xyxy.tolist()):
+        if foot_outside_frame(x1, y1, x2, y2, w, h):
+            # 足元が画面外に出たら、この人の追跡線はここで終わり
+            if track_id in result._current_id:
+                result._left_frame.add(track_id)
+            continue
+        if track_id in result._left_frame:
+            # 画面外から戻ってきた → 別の線として記録する
+            result._left_frame.discard(track_id)
+            result._current_id[track_id] = result._next_split_id
+            result._next_split_id += 1
+        out_id = result._current_id.setdefault(track_id, track_id)
         fx, fy = foot_point(x1, y1, x2, y2)
-        result.tracks.setdefault(track_id, []).append(TrackPoint(frame_idx, fx, fy))
+        result.tracks.setdefault(out_id, []).append(TrackPoint(frame_idx, fx, fy))
+
+
+def _renumber_split_ids(tracks: dict[int, list[TrackPoint]]) -> dict[int, list[TrackPoint]]:
+    """画面外から戻ってきた人の仮ID（100000〜）を、通常のIDの続きの番号に振り直す。"""
+    normal = [t for t in tracks if t < SPLIT_ID_BASE]
+    next_id = max(normal, default=0) + 1
+    out = {t: tracks[t] for t in normal}
+    for t in sorted(t for t in tracks if t >= SPLIT_ID_BASE):
+        out[next_id] = tracks[t]
+        next_id += 1
+    return out
+
+
+def split_at_frame_edges(tracks: dict[int, list[TrackPoint]], width: int, height: int) -> dict[int, list[TrackPoint]]:
+    """保存済みの足元座標から、画面の縁に張り付いた点を除き、そこで線を分ける。
+
+    この修正より前に解析した結果を開いたときにも、画面外の足元が描かれないようにするため。
+    """
+    m = edge_margin(width, height)
+    out: dict[int, list[TrackPoint]] = {}
+    next_id = max(tracks, default=0) + 1
+    for tid in sorted(tracks):
+        current: list[TrackPoint] = []
+        segments: list[list[TrackPoint]] = []
+        for p in tracks[tid]:
+            if p.y >= height - 1 - m or p.x <= m or p.x >= width - 1 - m:
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            current.append(p)
+        if current:
+            segments.append(current)
+        for k, seg in enumerate(segments):
+            if k == 0:
+                out[tid] = seg
+            else:
+                out[next_id] = seg
+                next_id += 1
+    return out

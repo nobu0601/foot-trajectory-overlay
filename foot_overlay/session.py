@@ -35,10 +35,10 @@ from .counting import (
     save_lines,
 )
 from .areas import AREA_KINDS, Area, detect_areas, load_areas, people_in_area, save_areas
-from .drawing import default_line_width, draw_overlay, smooth
+from .drawing import default_line_width, draw_overlay, filter_short_tracks, smooth
 from .export import save_image, save_tracks_csv
 from .suggest import DEFAULT_CANDIDATES, Suggestion, save_suggestions_csv, suggest_lines
-from .tracking import TrackingResult, TrackPoint
+from .tracking import TrackingResult, TrackPoint, split_at_frame_edges
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 MIN_LINE_PX = 5
@@ -124,10 +124,11 @@ class Session:
         self.meta = load_meta(result_dir / "meta.json")
         self.fps = float(self.meta.get("fps") or estimate_fps(tracks_path))
         self.smooth = int(self.meta.get("smooth", DEFAULT_SMOOTH))
-        self.tracks = load_tracks_csv(tracks_path)
-
         h, w = self.first_frame.shape[:2]
         self.width, self.height = w, h
+        # 足元が画面外に出た点は使わない（古い解析結果にも効くよう、読み込み時に処理する）
+        min_points = int(self.meta.get("min_points", 10))
+        self.tracks = filter_short_tracks(split_at_frame_edges(load_tracks_csv(tracks_path), w, h), min_points)
         self.scale = max(w, h) / 1280
         # 足元の位置の細かな揺れで二重に数えないよう、線からこの距離以上離れて初めて「渡った」とみなす
         self.margin = max(3.0, 0.01 * max(w, h))

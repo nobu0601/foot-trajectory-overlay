@@ -49,7 +49,14 @@ def draw_grid(img: np.ndarray, step: int) -> None:
 
 def default_line_width(width: int, height: int) -> int:
     """画像サイズに合わせた追跡線の標準の太さ。"""
-    return max(2, round(2 * max(width, height) / 1280))
+    return max(1, round(1.5 * max(width, height) / 1280))
+
+
+def outline_width(thickness: int) -> int:
+    """追跡線の黒い縁取りの太さ。細い線では縁取りをしない（線が太って見えないように）。"""
+    if thickness <= 1:
+        return 0
+    return thickness + (1 if thickness <= 3 else 2)
 
 
 def draw_overlay(
@@ -79,7 +86,7 @@ def draw_overlay(
     h, w = img.shape[:2]
     scale = max(w, h) / 1280
     thickness = line_width if line_width else default_line_width(w, h)
-    radius = max(3, thickness + 2)
+    radius = max(2, thickness + 1)
     font_scale = 0.5 * max(scale, 0.8)
     text_th = max(1, round(1.5 * max(scale, 0.8)))  # 文字の太さは追跡線の太さと切り離す
 
@@ -88,12 +95,15 @@ def draw_overlay(
         pts = np.round(xy).astype(np.int32)
         color = color_for_id(tid)
 
-        # 黒い縁取りを先に描いて、明るい背景でも線が見えるようにする
-        cv2.polylines(img, [pts], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        # 黒い縁取りを先に描いて、明るい背景でも線が見えるようにする（太さ1では縁取りなし）
+        outline = outline_width(thickness)
+        if outline:
+            cv2.polylines(img, [pts], False, (0, 0, 0), outline, cv2.LINE_AA)
         cv2.polylines(img, [pts], False, color, thickness, cv2.LINE_AA)
 
         start = tuple(int(v) for v in pts[0])
-        cv2.circle(img, start, radius + 1, (0, 0, 0), -1, cv2.LINE_AA)
+        if outline:
+            cv2.circle(img, start, radius + 1, (0, 0, 0), -1, cv2.LINE_AA)
         cv2.circle(img, start, radius, color, -1, cv2.LINE_AA)
 
         _draw_end_arrow(img, pts, color, thickness, radius)
@@ -115,7 +125,7 @@ def draw_overlay(
 def _draw_end_arrow(img, pts: np.ndarray, color, thickness: int, radius: int) -> None:
     """終点に、直近の移動方向を向いた矢印を描く。"""
     end = pts[-1]
-    min_len = radius * 3
+    min_len = max(10, radius * 3)  # 細い線でも矢印の向きが分かる長さにする
     # 終点から十分離れた点まで遡って方向を決める（短すぎると向きが不安定）
     for prev in pts[-2::-1]:
         if np.hypot(*(end - prev)) >= min_len:
@@ -123,7 +133,9 @@ def _draw_end_arrow(img, pts: np.ndarray, color, thickness: int, radius: int) ->
             tail = end - direction * min_len
             p1 = tuple(int(v) for v in np.round(tail))
             p2 = tuple(int(v) for v in end)
-            cv2.arrowedLine(img, p1, p2, (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.6)
+            outline = outline_width(thickness)
+            if outline:
+                cv2.arrowedLine(img, p1, p2, (0, 0, 0), outline, cv2.LINE_AA, tipLength=0.6)
             cv2.arrowedLine(img, p1, p2, color, thickness, cv2.LINE_AA, tipLength=0.6)
             return
     # ほとんど動いていない場合は四角で終点を示す
