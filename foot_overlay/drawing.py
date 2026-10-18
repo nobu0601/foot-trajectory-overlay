@@ -47,6 +47,11 @@ def draw_grid(img: np.ndarray, step: int) -> None:
         cv2.putText(img, str(y), (2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
 
+def default_line_width(width: int, height: int) -> int:
+    """画像サイズに合わせた追跡線の標準の太さ。"""
+    return max(2, round(2 * max(width, height) / 1280))
+
+
 def draw_overlay(
     first_frame: np.ndarray,
     tracks: dict[int, list[TrackPoint]],
@@ -54,12 +59,15 @@ def draw_overlay(
     dim: float = 0.35,
     show_ids: bool = True,
     grid: int = 0,
+    line_width: int | None = None,
 ) -> np.ndarray:
     """最初のフレームに全員の足元軌跡を重ねた画像を返す。
 
     - 線: 足元の通り道（IDごとに色分け）
     - 丸: 追跡の開始位置
     - 矢印: 追跡の終了位置と進行方向
+
+    line_width を省略すると、画像サイズに合った太さで描く。
     """
     img = first_frame.copy()
     if dim > 0:
@@ -70,9 +78,10 @@ def draw_overlay(
 
     h, w = img.shape[:2]
     scale = max(w, h) / 1280
-    thickness = max(2, round(2 * scale))
-    radius = max(4, round(5 * scale))
+    thickness = line_width if line_width else default_line_width(w, h)
+    radius = max(3, thickness + 2)
     font_scale = 0.5 * max(scale, 0.8)
+    text_th = max(1, round(1.5 * max(scale, 0.8)))  # 文字の太さは追跡線の太さと切り離す
 
     for tid in sorted(tracks):
         xy = smooth(tracks[tid], smooth_window)
@@ -91,14 +100,14 @@ def draw_overlay(
 
         if show_ids:
             label = str(tid)
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness + 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_th + 2)
             # 画面端で番号が切れないよう、画像内に収める
             org = (
                 min(max(start[0] + radius + 2, 0), w - tw - 2),
                 min(max(start[1] - radius - 2, th + 2), h - 2),
             )
-            cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-            cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, max(1, thickness - 1), cv2.LINE_AA)
+            cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), text_th + 2, cv2.LINE_AA)
+            cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_th, cv2.LINE_AA)
 
     return img
 

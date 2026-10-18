@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,21 +57,42 @@ def foot_point(x1: float, y1: float, x2: float, y2: float) -> tuple[float, float
     return (x1 + x2) / 2.0, y2
 
 
+ProgressCallback = Callable[[int, int, int], None]
+"""進み具合の通知: (処理済みフレーム数, 総フレーム数, これまでの追跡ID数)"""
+
+
+class TrackingCancelled(Exception):
+    """利用者が解析を中止した。"""
+
+
+def print_progress(done: int, total: int, ids: int) -> None:
+    percent = int(done * 100 / total) if total else 0
+    end = "\n" if total and done >= total else ""
+    print(f"\r  追跡中... {percent:3d}%  (人数ID: {ids})", end=end, flush=True)
+
+
 def track_video(
     video_path: Path,
     model_name: str = "yolo11n.pt",
     conf: float = 0.3,
     imgsz: int = 640,
-    frame_step: int = 1,
     tracker: str = "bytetrack.yaml",
     device: str = "cpu",
     max_frames: int | None = None,
+    progress: ProgressCallback | None = print_progress,
+    stop_event: threading.Event | None = None,
 ) -> TrackingResult:
-    """動画全体を処理し、追跡IDごとの足元座標リストを返す。"""
+    """動画の全フレームを解析し、追跡IDごとの足元座標リストを返す。
+
+    フレームの間引きはしない（追跡IDの取り違えや、線をまたぐ瞬間の見逃しを減らすため）。
+    """
     # ultralytics の読み込みは重いので、必要になってから import する
     from ultralytics import YOLO
 
-    model = YOLO(model_name)
+    from .runtime import disable_ultralytics_sync, resolve_model
+
+    disable_ultralytics_sync()
+    model = YOLO(resolve_model(model_name))
     cap, tmp_path = open_video(video_path)
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -84,26 +107,29 @@ def track_video(
         result = TrackingResult(first_frame=first.copy(), fps=fps, total_frames=total)
         frame_idx = 0
         frame = first
-        last_report = -1
+        reported = -1
 
         while True:
-            if frame_idx % frame_step == 0:
-                _track_one_frame(model, frame, frame_idx, result, conf, imgsz, tracker, device)
-
-            percent = int(frame_idx * 100 / total) if total else 0
-            if percent // 5 != last_report:
-                last_report = percent // 5
-                print(f"\r  追跡中... {percent:3d}%  (人数ID: {len(result.tracks)})", end="", flush=True)
-
+            if stop_event is not None and stop_event.is_set():
+                raise TrackingCancelled()
+            _track_one_frame(model, frame, frame_idx, result, conf, imgsz, tracker, device)
             frame_idx += 1
+
+            # 通知は 1% 刻み程度に抑える（画面更新やコンソール出力が処理を遅くしないように）
+            step = max(1, total // 100) if total else 30
+            if progress is not None and (frame_idx // step != reported):
+                reported = frame_idx // step
+                progress(frame_idx, max(total, frame_idx), len(result.tracks))
+
             if max_frames is not None and frame_idx >= max_frames:
                 break
             ok, frame = cap.read()
             if not ok:
                 break
 
-        print(f"\r  追跡中... 100%  (人数ID: {len(result.tracks)})")
         result.total_frames = frame_idx
+        if progress is not None:
+            progress(frame_idx, frame_idx, len(result.tracks))
         return result
     finally:
         cap.release()

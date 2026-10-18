@@ -1,4 +1,10 @@
-"""コマンドライン入口: python -m foot_overlay 動画.mp4"""
+"""コマンドライン入口。
+
+  python -m foot_overlay                       アプリ画面を開く
+  python -m foot_overlay 動画.mp4               解析して重畳画像を保存（画面なし）
+  python -m foot_overlay 動画名_overlay --line x1,y1,x2,y2
+                                               保存済みの結果でカウント線の通過人数を数える
+"""
 
 from __future__ import annotations
 
@@ -7,38 +13,47 @@ import sys
 import time
 from pathlib import Path
 
-from .drawing import draw_overlay, filter_short_tracks
-from .export import save_image, save_tracks_csv
+from .counting import parse_line_arg
+from .drawing import filter_short_tracks
+from .session import Session, write_result
 from .tracking import track_video
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="foot_overlay",
-        description="mp4動画の人物を追跡し、足元の軌跡を最初のフレームに重ねた画像を出力します。",
+        description=(
+            "mp4動画の全フレームで人物を追跡し、足元の軌跡を最初のフレームに重ねた画像を出力します。"
+            "引数なしで起動するとアプリ画面が開きます。"
+        ),
     )
-    p.add_argument("videos", nargs="+", type=Path, help="入力する動画ファイル（複数可）")
+    p.add_argument("inputs", nargs="+", type=Path, help="動画ファイル、または出力済みの 動画名_overlay フォルダ（複数可）")
     p.add_argument("-o", "--out-dir", type=Path, help="出力先フォルダ（省略時は 動画名_overlay/ を動画の隣に作成）")
     p.add_argument("--model", default="yolo11n.pt", help="YOLOモデル（既定: yolo11n.pt。精度重視なら yolo11s.pt）")
     p.add_argument("--conf", type=float, default=0.3, help="人物と判定する確信度のしきい値（既定: 0.3）")
     p.add_argument("--imgsz", type=int, default=640, help="推論時の画像サイズ（既定: 640。遠くの人が小さいなら 960 など）")
-    p.add_argument("--step", type=int, default=1, help="何フレームごとに処理するか（既定: 1。2にすると約2倍速）")
     p.add_argument("--min-points", type=int, default=10, help="この回数未満しか検出されなかったIDは描かない（既定: 10）")
     p.add_argument("--smooth", type=int, default=5, help="軌跡をならす移動平均の幅（既定: 5。1で無効）")
+    p.add_argument("--line-width", type=int, help="追跡線の太さpx（省略時は画像サイズに合わせて自動）")
     p.add_argument("--dim", type=float, default=0.35, help="背景を暗くする割合 0〜1（既定: 0.35）")
     p.add_argument("--grid", type=int, default=100, help="座標グリッドの間隔px（既定: 100。0で非表示）")
     p.add_argument("--no-ids", action="store_true", help="軌跡の始点にID番号を書かない")
     p.add_argument("--tracker", default="bytetrack.yaml", help="追跡アルゴリズム設定（既定: bytetrack.yaml）")
     p.add_argument("--device", default="cpu", help="推論デバイス（既定: cpu。NVIDIA GPU なら 0）")
     p.add_argument("--max-frames", type=int, help="先頭から指定フレーム数だけ処理する（お試し用）")
+    p.add_argument(
+        "--line",
+        action="append",
+        metavar="x1,y1,x2,y2",
+        help="カウント線を座標で指定する（複数回指定可）。線をまたいだ人数を数えて保存する",
+    )
     return p.parse_args(argv)
 
 
-def process(video: Path, args: argparse.Namespace) -> Path:
+def process_video(video: Path, args: argparse.Namespace) -> Path:
     out_dir = args.out_dir or video.with_name(f"{video.stem}_overlay")
-    if args.out_dir and len(args.videos) > 1:
+    if args.out_dir and len(args.inputs) > 1:
         out_dir = args.out_dir / video.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n▶ {video.name}")
     started = time.time()
@@ -47,47 +62,55 @@ def process(video: Path, args: argparse.Namespace) -> Path:
         model_name=args.model,
         conf=args.conf,
         imgsz=args.imgsz,
-        frame_step=max(1, args.step),
         tracker=args.tracker,
         device=args.device,
         max_frames=args.max_frames,
     )
-    # 間引き処理したときは、必要な検出回数もその分減らす
-    min_points = max(2, args.min_points // max(1, args.step))
-    tracks = filter_short_tracks(result.tracks, min_points)
-
-    overlay = draw_overlay(
-        result.first_frame,
-        tracks,
-        smooth_window=args.smooth,
-        dim=args.dim,
-        show_ids=not args.no_ids,
-        grid=args.grid,
-    )
-    save_image(out_dir / "overlay.png", overlay)
-    save_image(out_dir / "first_frame.png", result.first_frame)
-    save_tracks_csv(out_dir / "tracks.csv", tracks, result.fps)
+    tracks = filter_short_tracks(result.tracks, args.min_points)
+    view = {"line_width": args.line_width, "show_ids": not args.no_ids, "grid": args.grid, "dim": args.dim}
+    write_result(out_dir, video, result, tracks, smooth=args.smooth, min_points=args.min_points, view=view)
+    Session(out_dir).save()  # overlay.png を描く
 
     h, w = result.first_frame.shape[:2]
-    print(f"  動画: {w}x{h}, {result.fps:.1f}fps, {result.total_frames}フレーム")
-    print(f"  追跡ID: {len(result.tracks)}件 → 描画: {len(tracks)}件（{min_points}回未満の短いIDを除外）")
+    print(f"  動画: {w}x{h}, {result.fps:.1f}fps, {result.total_frames}フレーム（全フレーム解析）")
+    print(f"  追跡ID: {len(result.tracks)}件 → 描画: {len(tracks)}件（{args.min_points}回未満の短いIDを除外）")
     print(f"  処理時間: {time.time() - started:.0f}秒")
     print(f"  出力先: {out_dir}")
     return out_dir
 
 
+def count_with_lines(result_dir: Path, line_args: list[str], args: argparse.Namespace) -> None:
+    session = Session(result_dir)
+    if args.line_width:
+        session.line_width = args.line_width
+    session.set_lines([parse_line_arg(t) for t in line_args])
+    session.save()
+    print(f"\n▶ カウント結果（{result_dir.name}）")
+    for text in session.summary_lines():
+        print(f"  {text}")
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        from .app import main as app_main
+
+        return app_main([])
+
     args = parse_args(argv)
     failed = 0
-    for video in args.videos:
-        if not video.is_file():
-            print(f"ファイルが見つかりません: {video}", file=sys.stderr)
-            failed += 1
-            continue
+    for path in args.inputs:
         try:
-            process(video, args)
-        except Exception as e:  # 1本失敗しても残りの動画は処理する
-            print(f"\n✖ {video.name} の処理に失敗しました: {e}", file=sys.stderr)
+            if path.is_file():
+                path = process_video(path, args)
+            elif not path.is_dir():
+                print(f"ファイルが見つかりません: {path}", file=sys.stderr)
+                failed += 1
+                continue
+            if args.line:
+                count_with_lines(path, args.line, args)
+        except Exception as e:  # 1本失敗しても残りは処理する
+            print(f"\n✖ {path.name} の処理に失敗しました: {e}", file=sys.stderr)
             failed += 1
     return 1 if failed else 0
 

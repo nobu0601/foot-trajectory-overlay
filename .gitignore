@@ -7,3 +7,4 @@ __pycache__/
 *.mp4
 *.avi
 !foot_overlay/
+models/
