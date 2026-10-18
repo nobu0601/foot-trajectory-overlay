@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,7 +27,7 @@ from PIL import Image, ImageTk
 from .counting import CountLine
 from .drawing import filter_short_tracks
 from .session import Session, line_color, write_result
-from .tracking import TrackingCancelled, track_video
+from .tracking import TrackingCancelled, open_video, track_video
 
 APP_TITLE = "足元軌跡カウントツール"
 VIDEO_TYPES = [("動画ファイル", "*.mp4 *.MP4 *.mov *.MOV *.avi *.AVI"), ("すべてのファイル", "*.*")]
@@ -208,8 +209,10 @@ class App(tk.Tk):
         self.session = None
         self.pending = None
         self.render_dirty = True
+        self.rendered = read_first_frame(video)  # 解析中は最初のフレームを表示しておく
         self.refresh_table()
         self.canvas.delete("all")
+        self.schedule_redraw()
         self._set_busy(True)
         self.progress["value"] = 0
         self.status_var.set(f"{video.name}: 検出モデルを準備しています…（初回はダウンロードに時間がかかります）")
@@ -442,9 +445,9 @@ class App(tk.Tk):
     def redraw(self) -> None:
         self.redraw_job = None
         self.canvas.delete("image")
-        if self.session is None:
+        if self.session is None and self.rendered is None:
             return
-        if self.render_dirty or self.rendered is None:
+        if self.session is not None and (self.render_dirty or self.rendered is None):
             self.rendered = self.session.render()
             self.render_dirty = False
         cw, ch = max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1)
@@ -498,6 +501,19 @@ class App(tk.Tk):
             self.stop_event.set()
         self.flush_save()
         self.destroy()
+
+
+def read_first_frame(video: Path):
+    """動画の最初のフレーム（読めなければ None）。"""
+    try:
+        cap, tmp = open_video(video)
+    except Exception:
+        return None
+    ok, frame = cap.read()
+    cap.release()
+    if tmp is not None:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+    return frame if ok else None
 
 
 def _fmt_sec(sec: float) -> str:
