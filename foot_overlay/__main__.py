@@ -47,6 +47,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="x1,y1,x2,y2",
         help="カウント線を座標で指定する（複数回指定可）。線をまたいだ人数を数えて保存する",
     )
+    p.add_argument(
+        "--suggest",
+        nargs="?",
+        type=int,
+        const=20000,
+        metavar="本数",
+        help="エリアを自動検出し（areas.json があればそれを使う）、エリアごとにカウント線の候補を3本提案する。"
+        "本数はエリアごとに評価する候補線の数（既定: 20000）",
+    )
     return p.parse_args(argv)
 
 
@@ -90,6 +99,24 @@ def count_with_lines(result_dir: Path, line_args: list[str], args: argparse.Name
         print(f"  {text}")
 
 
+def suggest(result_dir: Path, n_candidates: int) -> None:
+    session = Session(result_dir)
+    if not session.areas:
+        session.auto_detect_areas()
+    print(f"\n▶ カウント線の候補（{result_dir.name}・エリア{len(session.areas)}件・各{n_candidates}本を評価）")
+    session.suggestions = session.compute_suggestions(n_candidates=n_candidates)
+    session.save()
+    for i, area in enumerate(session.areas):
+        print(f"  E{i + 1}（{area.kind_label}）: エリアを通った人 {session.area_people(i)}人")
+        for sg in [s for s in session.suggestions if s.area_index == i]:
+            ln = sg.line
+            print(
+                f"    候補{sg.rank}: ({ln.x1:.0f},{ln.y1:.0f})-({ln.x2:.0f},{ln.y2:.0f})"
+                f"  人数 {sg.people}人（{sg.coverage:.0%}） 通過 {sg.passes}回 二重カウント {sg.duplicates}回"
+            )
+    print(f"  保存先: {result_dir / 'suggestions.png'}")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
@@ -107,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"ファイルが見つかりません: {path}", file=sys.stderr)
                 failed += 1
                 continue
+            if args.suggest:
+                suggest(path, args.suggest)
             if args.line:
                 count_with_lines(path, args.line, args)
         except Exception as e:  # 1本失敗しても残りは処理する

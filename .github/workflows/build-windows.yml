@@ -49,13 +49,14 @@ jobs:
           Invoke-WebRequest "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/data/vtest.avi" -OutFile "smoke/テスト動画.avi"
           $exe = "dist/FootTrajectoryCounter/FootTrajectoryCounter.exe"
           # ネット接続なしでも動くよう、モデル名だけを渡して同梱モデルが使われることを確認する
-          $p = Start-Process -FilePath $exe -ArgumentList '--cli', 'smoke/テスト動画.avi', '--max-frames', '150', '--line', '400,150,400,420' -Wait -PassThru
+          $p = Start-Process -FilePath $exe -ArgumentList '--cli', 'smoke/テスト動画.avi', '--max-frames', '150', '--line', '400,150,400,420', '--suggest', '2000' -Wait -PassThru
           Get-Content "$env:LOCALAPPDATA/FootTrajectoryCounter/log.txt" -ErrorAction SilentlyContinue
           if ($p.ExitCode -ne 0) { throw "exe exited with $($p.ExitCode)" }
-          foreach ($f in "overlay.png", "count_result.png", "counts.csv", "tracks.csv") {
+          foreach ($f in "overlay.png", "count_result.png", "counts.csv", "tracks.csv", "suggestions.csv", "suggestions.png") {
             if (-not (Test-Path "smoke/テスト動画_overlay/$f")) { throw "missing $f" }
           }
           Get-Content "smoke/テスト動画_overlay/counts.csv"
+          Get-Content "smoke/テスト動画_overlay/suggestions.csv"
 
       - name: Package
         shell: pwsh
