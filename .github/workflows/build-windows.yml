@@ -1,12 +1,18 @@
 # Windows 用 exe を作る。
 # - v で始まるタグ（例: v0.2.0）を push すると、Releases に zip を公開する
-# - Actions 画面の「Run workflow」からも手動で実行できる（成果物は Artifacts に置かれる）
+# - Actions 画面の「Run workflow」からも手動で実行できる（成果物は Artifacts に置かれる）。
+#   release_tag にバージョン名（例: v0.2.0）を入れると、そのタグを作って Releases に公開する
 name: Build Windows exe
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Releases に公開するときのバージョン名（例: v0.2.0）。空なら公開しない"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -70,7 +76,13 @@ jobs:
           path: FootTrajectoryCounter-windows.zip
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ inputs.release_tag || github.ref_name }}
           files: FootTrajectoryCounter-windows.zip
+          body: |
+            Windows 用（オフラインPCで動作）。zip を展開し、FootTrajectoryCounter フォルダ内の
+            FootTrajectoryCounter.exe を起動してください。使い方は同梱の README.md を参照。
