@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.pt
+*_overlay/
+*.mp4
+*.avi
+!foot_overlay/

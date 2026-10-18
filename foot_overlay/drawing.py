@@ -1,0 +1,122 @@
+"""足元軌跡の整形と、最初のフレームへの重畳描画。"""
+
+from __future__ import annotations
+
+import colorsys
+
+import cv2
+import numpy as np
+
+from .tracking import TrackPoint
+
+
+def filter_short_tracks(tracks: dict[int, list[TrackPoint]], min_points: int) -> dict[int, list[TrackPoint]]:
+    """検出回数が少ないID（誤検出・一瞬だけ映った人）を除く。"""
+    return {tid: pts for tid, pts in tracks.items() if len(pts) >= min_points}
+
+
+def smooth(points: list[TrackPoint], window: int) -> np.ndarray:
+    """移動平均で足元座標のブレをならす。戻り値は (N, 2) の配列。"""
+    xy = np.array([(p.x, p.y) for p in points], dtype=np.float64)
+    if window <= 1 or len(xy) < 3:
+        return xy
+    window = min(window, len(xy))
+    pad = window // 2
+    # 端は端の値で埋めて、始点・終点が内側へ縮まないようにする
+    padded = np.pad(xy, ((pad, window - 1 - pad), (0, 0)), mode="edge")
+    kernel = np.ones(window) / window
+    return np.stack([np.convolve(padded[:, i], kernel, mode="valid") for i in range(2)], axis=1)
+
+
+def color_for_id(track_id: int) -> tuple[int, int, int]:
+    """IDごとに見分けやすい色（BGR）を決める。黄金比で色相をずらす。"""
+    hue = (track_id * 0.618033988749895) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.85, 1.0)
+    return int(b * 255), int(g * 255), int(r * 255)
+
+
+def draw_grid(img: np.ndarray, step: int) -> None:
+    """カウント線の座標を読み取りやすいよう、座標付きの格子を描く。"""
+    h, w = img.shape[:2]
+    color = (200, 200, 200)
+    for x in range(step, w, step):
+        cv2.line(img, (x, 0), (x, h), color, 1, cv2.LINE_AA)
+        cv2.putText(img, str(x), (x + 2, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    for y in range(step, h, step):
+        cv2.line(img, (0, y), (w, y), color, 1, cv2.LINE_AA)
+        cv2.putText(img, str(y), (2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+
+def draw_overlay(
+    first_frame: np.ndarray,
+    tracks: dict[int, list[TrackPoint]],
+    smooth_window: int = 5,
+    dim: float = 0.35,
+    show_ids: bool = True,
+    grid: int = 0,
+) -> np.ndarray:
+    """最初のフレームに全員の足元軌跡を重ねた画像を返す。
+
+    - 線: 足元の通り道（IDごとに色分け）
+    - 丸: 追跡の開始位置
+    - 矢印: 追跡の終了位置と進行方向
+    """
+    img = first_frame.copy()
+    if dim > 0:
+        # 背景を少し暗くして線を目立たせる
+        img = cv2.addWeighted(img, 1.0 - dim, np.zeros_like(img), dim, 0)
+    if grid > 0:
+        draw_grid(img, grid)
+
+    h, w = img.shape[:2]
+    scale = max(w, h) / 1280
+    thickness = max(2, round(2 * scale))
+    radius = max(4, round(5 * scale))
+    font_scale = 0.5 * max(scale, 0.8)
+
+    for tid in sorted(tracks):
+        xy = smooth(tracks[tid], smooth_window)
+        pts = np.round(xy).astype(np.int32)
+        color = color_for_id(tid)
+
+        # 黒い縁取りを先に描いて、明るい背景でも線が見えるようにする
+        cv2.polylines(img, [pts], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.polylines(img, [pts], False, color, thickness, cv2.LINE_AA)
+
+        start = tuple(int(v) for v in pts[0])
+        cv2.circle(img, start, radius + 1, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, start, radius, color, -1, cv2.LINE_AA)
+
+        _draw_end_arrow(img, pts, color, thickness, radius)
+
+        if show_ids:
+            label = str(tid)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness + 2)
+            # 画面端で番号が切れないよう、画像内に収める
+            org = (
+                min(max(start[0] + radius + 2, 0), w - tw - 2),
+                min(max(start[1] - radius - 2, th + 2), h - 2),
+            )
+            cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+            cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, max(1, thickness - 1), cv2.LINE_AA)
+
+    return img
+
+
+def _draw_end_arrow(img, pts: np.ndarray, color, thickness: int, radius: int) -> None:
+    """終点に、直近の移動方向を向いた矢印を描く。"""
+    end = pts[-1]
+    min_len = radius * 3
+    # 終点から十分離れた点まで遡って方向を決める（短すぎると向きが不安定）
+    for prev in pts[-2::-1]:
+        if np.hypot(*(end - prev)) >= min_len:
+            direction = (end - prev) / np.hypot(*(end - prev))
+            tail = end - direction * min_len
+            p1 = tuple(int(v) for v in np.round(tail))
+            p2 = tuple(int(v) for v in end)
+            cv2.arrowedLine(img, p1, p2, (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.6)
+            cv2.arrowedLine(img, p1, p2, color, thickness, cv2.LINE_AA, tipLength=0.6)
+            return
+    # ほとんど動いていない場合は四角で終点を示す
+    x, y = int(end[0]), int(end[1])
+    cv2.rectangle(img, (x - radius, y - radius), (x + radius, y + radius), color, -1)
