@@ -63,6 +63,13 @@ jobs:
           }
           Get-Content "smoke/テスト動画_overlay/counts.csv"
           Get-Content "smoke/テスト動画_overlay/suggestions.csv"
+          # 一括処理（フォルダ指定）も動くことを確認する
+          New-Item -ItemType Directory -Force smoke_batch/sub | Out-Null
+          Copy-Item "smoke/テスト動画.avi" "smoke_batch/sub/カメラ1.avi"
+          $p = Start-Process -FilePath $exe -ArgumentList '--batch', 'smoke_batch', '-o', 'smoke_batch_out' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content "$env:LOCALAPPDATA/FootTrajectoryCounter/log.txt"; throw "batch exited with $($p.ExitCode)" }
+          if (-not (Test-Path "smoke_batch_out/sub_カメラ1.png")) { throw "missing batch image" }
+          Get-Content "smoke_batch_out/batch_summary.csv"
 
       - name: Package
         shell: pwsh

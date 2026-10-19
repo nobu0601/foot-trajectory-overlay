@@ -25,6 +25,7 @@ import cv2
 from PIL import Image, ImageTk
 
 from .areas import AREA_KINDS
+from .export import save_image
 from .counting import CountLine
 from .drawing import filter_short_tracks
 from .session import Session, SuggestionCancelled, line_color, write_result
@@ -98,6 +99,8 @@ class App(tk.Tk):
         self.btn_video.pack(side=tk.LEFT)
         self.btn_result = ttk.Button(toolbar, text="解析結果を開く…", command=self.choose_result)
         self.btn_result.pack(side=tk.LEFT, padx=(6, 0))
+        self.btn_batch = ttk.Button(toolbar, text="一括処理…", command=self.open_batch)
+        self.btn_batch.pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(toolbar, text="検出モデル:").pack(side=tk.LEFT, padx=(16, 4))
         self.model_var = tk.StringVar(value=next(iter(MODELS)))
         self.model_box = ttk.Combobox(toolbar, textvariable=self.model_var, values=list(MODELS), state="readonly", width=18)
@@ -161,15 +164,38 @@ class App(tk.Tk):
         self.dim_scale = ttk.Scale(box, from_=0, to=80, orient=tk.HORIZONTAL, command=self.on_dim_change)
         self.dim_scale.pack(fill=tk.X, pady=(0, 6))
 
+        # 表示する時間帯（人数の集計や候補提案には影響しない）
+        self.time_label = ttk.Label(box, text="表示する時間帯: 全時間")
+        self.time_label.pack(anchor=tk.W)
+        time_row = ttk.Frame(box)
+        time_row.pack(fill=tk.X)
+        ttk.Label(time_row, text="開始").grid(row=0, column=0, sticky=tk.W)
+        self.start_scale = ttk.Scale(time_row, from_=0, to=1, orient=tk.HORIZONTAL, command=self.on_time_change)
+        self.start_scale.grid(row=0, column=1, sticky=tk.EW, padx=4)
+        ttk.Label(time_row, text="終了").grid(row=1, column=0, sticky=tk.W)
+        self.end_scale = ttk.Scale(time_row, from_=0, to=1, orient=tk.HORIZONTAL, command=self.on_time_change)
+        self.end_scale.grid(row=1, column=1, sticky=tk.EW, padx=4)
+        time_row.columnconfigure(1, weight=1)
+        time_btns = ttk.Frame(box)
+        time_btns.pack(fill=tk.X, pady=(2, 6))
+        self.btn_all_time = ttk.Button(time_btns, text="全時間を表示", command=self.reset_time_range)
+        self.btn_all_time.pack(side=tk.LEFT)
+        self.btn_save_view = ttk.Button(time_btns, text="表示中の画像を保存…", command=self.save_view_image)
+        self.btn_save_view.pack(side=tk.RIGHT)
+
+        checks = ttk.Frame(box)
+        checks.pack(fill=tk.X)
         self.ids_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(box, text="追跡ID番号を表示", variable=self.ids_var, command=self.on_view_toggle).pack(anchor=tk.W)
+        ttk.Checkbutton(checks, text="追跡ID番号", variable=self.ids_var, command=self.on_view_toggle).grid(
+            row=0, column=0, sticky=tk.W
+        )
         self.grid_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(box, text="座標の格子を表示（100px）", variable=self.grid_var, command=self.on_view_toggle).pack(
-            anchor=tk.W
+        ttk.Checkbutton(checks, text="座標の格子（100px）", variable=self.grid_var, command=self.on_view_toggle).grid(
+            row=0, column=1, sticky=tk.W, padx=(12, 0)
         )
         self.areas_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(box, text="エリアと候補線を表示", variable=self.areas_var, command=self.on_view_toggle).pack(
-            anchor=tk.W
+        ttk.Checkbutton(checks, text="エリアと候補線", variable=self.areas_var, command=self.on_view_toggle).grid(
+            row=1, column=0, sticky=tk.W
         )
 
     def _build_count_panel(self, box) -> None:
@@ -401,6 +427,13 @@ class App(tk.Tk):
         self.dim_scale.set(round(session.dim * 100))
         self.ids_var.set(session.show_ids)
         self.grid_var.set(session.grid > 0)
+        self._setting_time = True
+        duration = max(session.duration, 0.1)
+        self.start_scale.configure(to=duration)
+        self.end_scale.configure(to=duration)
+        self.start_scale.set(0)
+        self.end_scale.set(duration)
+        self._setting_time = False
         self._update_view_labels()
         self.render_dirty = True
         self.refresh_table()
@@ -442,6 +475,76 @@ class App(tk.Tk):
             return
         self.width_label.config(text=f"追跡線の太さ: {self.session.line_width}")
         self.dim_label.config(text=f"背景の暗さ: {round(self.session.dim * 100)}%")
+        s = self.session
+        shown, total = len(s.visible_tracks()), len(s.tracks)
+        if s.is_time_filtered():
+            text = f"表示する時間帯: {_fmt_clock(s.time_start)}〜{_fmt_clock(s.time_end)}（{shown}/{total}人）"
+        else:
+            text = f"表示する時間帯: 全時間 0:00〜{_fmt_clock(s.duration)}（{total}人）"
+        self.time_label.config(text=text)
+
+    def on_time_change(self, _value=None) -> None:
+        if self.session is None or getattr(self, "_setting_time", False):
+            return
+        start = float(self.start_scale.get())
+        end = float(self.end_scale.get())
+        if start > end:  # 開始が終了を追い越したら、もう一方も動かして揃える
+            self._setting_time = True
+            if abs(start - self.session.time_start) > 1e-9:
+                self.end_scale.set(start)
+                end = start
+            else:
+                self.start_scale.set(end)
+                start = end
+            self._setting_time = False
+        # 動画の端まで寄せたときは「全時間」と同じ扱いにする
+        if end >= self.session.duration - 0.05:
+            end = self.session.duration
+        if (start, end) != (self.session.time_start, self.session.time_end):
+            self.session.time_start, self.session.time_end = start, end
+            self.render_dirty = True
+            self.schedule_redraw()  # 表示だけの変更なので保存はしない
+        self._update_view_labels()
+
+    def reset_time_range(self) -> None:
+        if self.session is None:
+            return
+        self._setting_time = True
+        self.start_scale.set(0)
+        self.end_scale.set(self.session.duration)
+        self._setting_time = False
+        self.on_time_change()
+
+    def save_view_image(self) -> None:
+        """いま表示している画像（時間帯の絞り込み・カウント線を含む）を保存する。"""
+        if self.session is None:
+            return
+        s = self.session
+        name = f"{Path(s.video_name).stem}_view"
+        if s.is_time_filtered():
+            name += f"_{_fmt_clock(s.time_start).replace(':', 'm')}s-{_fmt_clock(s.time_end).replace(':', 'm')}s"
+        path = filedialog.asksaveasfilename(
+            title="表示中の画像を保存",
+            initialdir=str(s.dir),
+            initialfile=name + ".png",
+            defaultextension=".png",
+            filetypes=[("PNG 画像", "*.png"), ("JPEG 画像", "*.jpg")],
+        )
+        if not path:
+            return
+        try:
+            save_image(Path(path), s.render(self.selected_area, self.selected_suggestion))
+            self.status_var.set(f"保存しました: {path}")
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"保存に失敗しました。\n\n{e}")
+
+    def open_batch(self) -> None:
+        """一括処理の画面を開く。"""
+        from .batch_dialog import BatchDialog
+
+        self.flush_save()
+        width = self.session.line_width if self.session is not None else 1
+        BatchDialog(self, MODELS, self.model_var.get(), width, open_in_file_manager, self.load_result)
 
     def view_changed(self) -> None:
         self.render_dirty = True
@@ -888,6 +991,8 @@ class App(tk.Tk):
             self.btn_delete,
             self.btn_clear,
             self.btn_folder,
+            self.btn_batch,
+            self.btn_save_view,
             self.btn_detect,
             self.btn_add_area,
             self.btn_del_area,
@@ -918,6 +1023,12 @@ def read_first_frame(video: Path):
     if tmp is not None:
         shutil.rmtree(tmp.parent, ignore_errors=True)
     return frame if ok else None
+
+
+def _fmt_clock(sec: float) -> str:
+    """秒を 分:秒 の形にする（例: 83.4 → 1:23）。"""
+    sec = int(round(sec))
+    return f"{sec // 60}:{sec % 60:02d}"
 
 
 def _fmt_sec(sec: float) -> str:

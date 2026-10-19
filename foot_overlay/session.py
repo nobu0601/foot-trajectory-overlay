@@ -138,7 +138,8 @@ class Session:
         self.show_ids: bool = bool(view.get("show_ids", True))
         self.grid: int = int(view.get("grid", 100))
         self.dim: float = float(view.get("dim", 0.35))
-        self._overlay_cache: tuple[tuple, np.ndarray] | None = None
+        # 表示用（絞り込みあり）と保存用（全員）の2枚を別々に覚えておく
+        self._overlay_cache: dict[bool, tuple[tuple, np.ndarray]] = {}
 
         self.lines: list[CountLine] = load_lines(result_dir / "lines.json")
         self.counts: list[LineCount] = []
@@ -150,9 +151,30 @@ class Session:
         self.show_areas = True
         self._tracks_xy: dict[int, np.ndarray] | None = None
 
+        # 表示する時間帯（秒）。表示だけの絞り込みで、人数の集計や候補提案には使わない
+        self.time_start: float = 0.0
+        self.time_end: float = self.duration
+
     @property
     def video_name(self) -> str:
         return self.meta.get("video", self.dir.name)
+
+    @property
+    def duration(self) -> float:
+        """動画の長さ（秒）。"""
+        last = max((pts[-1].frame for pts in self.tracks.values() if pts), default=0)
+        frames = max(int(self.meta.get("frames") or 0), last + 1)
+        return frames / self.fps if self.fps else 0.0
+
+    def is_time_filtered(self) -> bool:
+        return self.time_start > 0 or self.time_end < self.duration - 1e-6
+
+    def visible_tracks(self) -> dict[int, list[TrackPoint]]:
+        """表示する時間帯に映っていた人の追跡線（線は途中で切らず、その人の全体を描く）。"""
+        if not self.is_time_filtered():
+            return self.tracks
+        f0, f1 = self.time_start * self.fps, self.time_end * self.fps
+        return {tid: pts for tid, pts in self.tracks.items() if pts and pts[0].frame <= f1 and pts[-1].frame >= f0}
 
     # ---- カウント線 ----
 
@@ -269,25 +291,36 @@ class Session:
 
     # ---- 描画 ----
 
-    def overlay(self) -> np.ndarray:
-        """足元軌跡の重畳画像（表示設定が変わったときだけ描き直す）。"""
-        key = (self.line_width, self.show_ids, self.grid, self.dim)
-        if self._overlay_cache is None or self._overlay_cache[0] != key:
+    def overlay(self, all_tracks: bool = False) -> np.ndarray:
+        """足元軌跡の重畳画像（表示設定が変わったときだけ描き直す）。
+
+        all_tracks=True なら時間帯の絞り込みをせず全員を描く（保存用）。
+        """
+        filtered = not all_tracks and self.is_time_filtered()
+        time_key = (self.time_start, self.time_end) if filtered else None
+        key = (self.line_width, self.show_ids, self.grid, self.dim, time_key)
+        cached = self._overlay_cache.get(filtered)
+        if cached is None or cached[0] != key:
             img = draw_overlay(
                 self.first_frame,
-                self.tracks,
+                self.visible_tracks() if filtered else self.tracks,
                 smooth_window=self.smooth,
                 dim=self.dim,
                 show_ids=self.show_ids,
                 grid=self.grid,
                 line_width=self.line_width,
             )
-            self._overlay_cache = (key, img)
-        return self._overlay_cache[1]
+            self._overlay_cache[filtered] = (key, img)
+        return self._overlay_cache[filtered][1]
 
-    def render(self, highlight_area: int | None = None, selected_suggestion: int | None = None) -> np.ndarray:
+    def render(
+        self,
+        highlight_area: int | None = None,
+        selected_suggestion: int | None = None,
+        all_tracks: bool = False,
+    ) -> np.ndarray:
         """重畳画像に、エリア・候補線・カウント線・通過位置を描いた画像。"""
-        img = self.overlay().copy()
+        img = self.overlay(all_tracks).copy()
         thick = max(2, round(3 * self.scale))
         if self.show_areas:
             self.draw_areas(img, highlight=highlight_area)
@@ -338,7 +371,7 @@ class Session:
 
     def render_suggestions_image(self) -> np.ndarray:
         """保存用: エリアと候補線と各候補の人数。"""
-        img = self.overlay().copy()
+        img = self.overlay(all_tracks=True).copy()
         thick = max(2, round(3 * self.scale))
         self.draw_areas(img)
         self.draw_suggestions(img, thick)
@@ -367,7 +400,7 @@ class Session:
         show = self.show_areas
         self.show_areas = False  # カウント結果の画像にはエリアと候補を描かない
         try:
-            img = self.render()
+            img = self.render(all_tracks=True)
         finally:
             self.show_areas = show
         rows = [(f"{self.video_name}", (220, 220, 220))] if self.video_name.isascii() else []
@@ -387,7 +420,7 @@ class Session:
             "dim": self.dim,
         }
         (self.dir / "meta.json").write_text(json.dumps(self.meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        save_image(self.dir / "overlay.png", self.overlay())
+        save_image(self.dir / "overlay.png", self.overlay(all_tracks=True))
         save_lines(self.dir / "lines.json", self.lines)
         save_counts_csv(self.dir / "counts.csv", self.lines, self.counts)
         save_crossings_csv(self.dir / "crossings.csv", self.crossings, self.fps)

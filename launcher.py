@@ -3,6 +3,7 @@
   FootTrajectoryCounter.exe                 アプリ画面を開く
   FootTrajectoryCounter.exe 動画.mp4         その動画の解析から始める
   FootTrajectoryCounter.exe --cli ...       画面なしのコマンド版（python -m foot_overlay と同じ引数）
+  FootTrajectoryCounter.exe --batch ...     画面なしの一括処理（python -m foot_overlay.batch と同じ引数）
 """
 
 from __future__ import annotations
@@ -38,6 +39,10 @@ def main() -> int:
     configure_offline()  # ultralytics を読み込む前に設定する必要がある
 
     args = sys.argv[1:]
+    if args[:1] == ["--batch"]:
+        from foot_overlay.batch import main as batch_main
+
+        return batch_main(args[1:])
     if args[:1] == ["--cli"]:
         from foot_overlay.__main__ import main as cli_main
 
