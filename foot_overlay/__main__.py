@@ -103,7 +103,9 @@ def suggest(result_dir: Path, n_candidates: int) -> None:
     session = Session(result_dir)
     if not session.areas:
         session.auto_detect_areas()
-    print(f"\n▶ カウント線の候補（{result_dir.name}・エリア{len(session.areas)}件・各{n_candidates}本を評価）")
+    print(f"\n▶ カウント線の候補（{result_dir.name}・エリア{len(session.areas)}件・各最大{n_candidates}本を評価）")
+    if session.suspects:
+        print(f"  誤判定らしい追跡線 {len(session.suspects)}本（ID: {', '.join(map(str, sorted(session.suspects)))}）が通らない位置に引きます")
     session.suggestions = session.compute_suggestions(n_candidates=n_candidates)
     session.save()
     for i, area in enumerate(session.areas):
@@ -112,7 +114,8 @@ def suggest(result_dir: Path, n_candidates: int) -> None:
             ln = sg.line
             print(
                 f"    候補{sg.rank}: ({ln.x1:.0f},{ln.y1:.0f})-({ln.x2:.0f},{ln.y2:.0f})"
-                f"  人数 {sg.people}人（{sg.coverage:.0%}） 通過 {sg.passes}回 二重カウント {sg.duplicates}回"
+                f"  人数 {sg.people}人（{sg.coverage:.0%}） 通過 {sg.passes}回（推定 {sg.lower}〜{sg.upper}回）"
+                f" 信頼度 {sg.reliability:.0f}点 {sg.grade}"
             )
     print(f"  保存先: {result_dir / 'suggestions.png'}")
 

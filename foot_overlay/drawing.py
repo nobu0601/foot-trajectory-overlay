@@ -47,6 +47,21 @@ def draw_grid(img: np.ndarray, step: int) -> None:
         cv2.putText(img, str(y), (2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
 
+SUSPECT_COLOR = (150, 150, 150)  # 誤判定らしい追跡線の色（灰色）
+
+
+def draw_dashed_polyline(img: np.ndarray, pts: np.ndarray, color, thickness: int, dash: int) -> None:
+    """折れ線を点線で描く（道のりに沿って dash px 描いて dash px あける）。"""
+    if len(pts) < 2:
+        return
+    seg = np.diff(pts.astype(np.float64), axis=0)
+    dist = np.concatenate([[0.0], np.cumsum(np.hypot(seg[:, 0], seg[:, 1]))])
+    on = (dist // dash) % 2 == 0
+    for i in range(len(pts) - 1):
+        if on[i]:
+            cv2.line(img, tuple(int(v) for v in pts[i]), tuple(int(v) for v in pts[i + 1]), color, thickness, cv2.LINE_AA)
+
+
 def default_line_width(width: int, height: int) -> int:
     """画像サイズに合わせた追跡線の標準の太さ。"""
     return max(1, round(1.5 * max(width, height) / 1280))
@@ -67,6 +82,7 @@ def draw_overlay(
     show_ids: bool = True,
     grid: int = 0,
     line_width: int | None = None,
+    suspects: frozenset[int] | set[int] = frozenset(),
 ) -> np.ndarray:
     """最初のフレームに全員の足元軌跡を重ねた画像を返す。
 
@@ -93,6 +109,13 @@ def draw_overlay(
     for tid in sorted(tracks):
         xy = smooth(tracks[tid], smooth_window)
         pts = np.round(xy).astype(np.int32)
+        if tid in suspects:
+            # 誤判定らしい線は灰色の点線で、色付きの線と区別する
+            draw_dashed_polyline(img, pts, SUSPECT_COLOR, thickness, dash=max(6, 4 * thickness))
+            if show_ids:
+                cv2.putText(img, str(tid), (int(pts[0][0]) + 4, int(pts[0][1]) - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale, SUSPECT_COLOR, text_th, cv2.LINE_AA)
+            continue
         color = color_for_id(tid)
 
         # 黒い縁取りを先に描いて、明るい背景でも線が見えるようにする（太さ1では縁取りなし）

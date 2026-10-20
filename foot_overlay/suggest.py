@@ -1,20 +1,20 @@
 """エリアごとに、最も多く人を数えられるカウント線の候補を提案する。
 
 手順:
-  1. エリア内のランダムな点を通り、ランダムな向きで、エリアの縁から縁まで横断する線を
-     n_candidates 本（既定 20,000 本）作る
-  2. 全ての線について、またいだ人数とまたいだ回数を数える
-  3. 評価値 = またいだ人数 − 二重カウント（同じ人が1秒以内に線をまたぎ直した回数）
-     まず全候補を高速な方法で評価し、上位の候補を実際のカウント処理と同じ方法で数え直す
-  4. 評価値の高い順に、互いに離れた位置にある線を top_k 本（既定3本）選ぶ
-同じエリア・同じ軌跡なら毎回同じ結果になるよう、乱数の種は固定している。
+  1. 人の流れの中心線に沿って、流れに直角（±20°）でエリアの縁から縁まで引いた線を
+     最大 n_candidates 本（既定 20,000 本）作る（flowlines.py）
+  2. 誤判定らしい追跡線（suspects.py）が通る線は除く
+  3. まず全候補を高速な方法で評価し、上位の候補を実際のカウント処理と同じ方法で数え直す
+  4. 上位の候補の信頼度（evaluate.py）を出し、評価値 = 人数 × 信頼度÷100 の高い順に、
+     互いに離れた位置にある線を top_k 本（既定3本）選ぶ
+同じエリア・同じ軌跡なら毎回同じ結果になる（乱数は使っていない）。
 """
 
 from __future__ import annotations
 
 import csv
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +26,7 @@ from .tracking import TrackPoint
 
 DEFAULT_CANDIDATES = 20000
 RESCORE = 400  # 実際のカウント処理で数え直す候補の数
+EVALUATE = 30  # 信頼度を出す候補の数（1本あたり百ミリ秒ほどかかるので絞る）
 REPEAT_SEC = 1.0  # この秒数以内に同じ人が線をまたぎ直したら二重カウントとみなす
 CHUNK = 256  # 一度にまとめて評価する線の本数（メモリ使用量の上限を決める）
 
@@ -39,6 +40,16 @@ class Suggestion:
     duplicates: int  # 二重カウントの回数（同じ人が短時間にまたぎ直した回数）
     area_people: int  # エリアを通った人数
     passes: int = 0  # 通過回数の合計（往復した人は2回）
+    reliability: float = 0.0  # 信頼度 0〜100
+    grade: str = ""  # A / B / C
+    lower: int = 0  # 推定範囲の下限
+    upper: int = 0  # 推定範囲の上限
+    reasons: list[str] = field(default_factory=list)  # 信頼度が低い理由
+
+    @property
+    def final_score(self) -> float:
+        """順位を決める評価値 = 人数 × 信頼度÷100"""
+        return self.people * self.reliability / 100
 
     @property
     def score(self) -> int:
@@ -134,7 +145,25 @@ def _segments_near(tracks_xy: dict[int, np.ndarray], bbox: tuple, step: float):
 
 
 def score_lines(lines: np.ndarray, P: np.ndarray, Q: np.ndarray, starts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """各線について (またいだ人数, またいだ回数の合計) を返す。"""
+    """各線について (またいだ人数, またいだ回数の合計) を返す。
+
+    線の束が狭い範囲にまとまっているときは、その範囲の近くを通る線分だけを比べて速くする。
+    """
+    person = np.zeros(len(P), dtype=np.int64)  # 各線分が何人目の軌跡か
+    person[starts[1:]] = 1
+    person = np.cumsum(person)
+    lo = np.minimum(lines[:, 0:2], lines[:, 2:4]).min(axis=0)
+    hi = np.maximum(lines[:, 0:2], lines[:, 2:4]).max(axis=0)
+    near = (
+        (np.maximum(P[:, 0], Q[:, 0]) >= lo[0])
+        & (np.minimum(P[:, 0], Q[:, 0]) <= hi[0])
+        & (np.maximum(P[:, 1], Q[:, 1]) >= lo[1])
+        & (np.minimum(P[:, 1], Q[:, 1]) <= hi[1])
+    )
+    if not near.any():
+        return np.zeros(len(lines), dtype=np.int64), np.zeros(len(lines), dtype=np.int64)
+    P, Q, person = P[near].astype(np.float32), Q[near].astype(np.float32), person[near]
+    lines = lines.astype(np.float32)
     A, B = lines[:, None, 0:2], lines[:, None, 2:4]  # (L, 1, 2)
     ab = B - A
 
@@ -146,9 +175,13 @@ def score_lines(lines: np.ndarray, P: np.ndarray, Q: np.ndarray, starts: np.ndar
     pq = (Q - P)[None]
     d3 = cross(pq, A - P[None])
     d4 = cross(pq, B - P[None])
-    hit = ((d1 * d2) < 0) & ((d3 * d4) < 0)  # (L, M)
-    per_person = np.add.reduceat(hit.astype(np.int32), starts, axis=1)  # (L, 人数)
-    return (per_person > 0).sum(axis=1), per_person.sum(axis=1)
+    hit = (((d1 * d2) < 0) & ((d3 * d4) < 0)).astype(np.float32)  # (L, M)
+    # 線分ごとの交差を人ごとに合計する（近くを通った人だけの対応表との行列の掛け算）
+    ids, local = np.unique(person, return_inverse=True)
+    onehot = np.zeros((len(person), len(ids)), dtype=np.float32)
+    onehot[np.arange(len(person)), local] = 1
+    per_person = hit @ onehot  # (L, 人数)
+    return (per_person > 0).sum(axis=1).astype(np.int64), per_person.sum(axis=1).round().astype(np.int64)
 
 
 def exact_scores(
@@ -181,6 +214,28 @@ def exact_scores(
     return people, repeats, passes
 
 
+def _spread(order: np.ndarray, mids: np.ndarray, min_dist: float, limit: int) -> list[int]:
+    """order の順に、すでに選んだ線と中点が min_dist 以上離れた線だけを limit 本まで選ぶ。
+
+    足りなければ、離れていない線も順に足して limit 本にする（候補が少ないエリアのため）。
+    """
+    chosen: list[int] = []
+    kept = np.zeros((0, 2))
+    for k in order:
+        if len(kept) == 0 or np.min(np.hypot(*(kept - mids[k]).T)) >= min_dist:
+            chosen.append(int(k))
+            kept = np.vstack([kept, mids[k]])
+            if len(chosen) >= limit:
+                return chosen
+    picked = set(chosen)
+    for k in order:
+        if len(chosen) >= limit:
+            break
+        if int(k) not in picked:
+            chosen.append(int(k))
+    return chosen
+
+
 def suggest_lines(
     area: Area,
     area_index: int,
@@ -195,90 +250,134 @@ def suggest_lines(
     top_k: int = 3,
     seed: int = 0,
     progress: ProgressCallback | None = None,
+    suspects: set[int] | None = None,
 ) -> list[Suggestion]:
     """1つのエリアについて、カウント線の候補を最大 top_k 本返す。
 
-    20,000 本すべてを高速な方法（間引いた軌跡との交差判定）でふるいにかけ、
-    上位 RESCORE 本だけを実際のカウント処理と同じ方法で数え直して順位を決める。
+    1. 人の流れに直角（±20°）で、エリアの縁から縁まで引いた線を最大 n_candidates 本作る
+    2. 誤判定らしい追跡線（suspects）が通る線は除く
+    3. 全候補を高速な方法でふるいにかけ、上位 RESCORE 本を実際のカウント処理で数え直す
+    4. 上位 EVALUATE 本の信頼度を出し、「人数 × 信頼度÷100」の高い順に位置が離れた3本を選ぶ
     """
+    from .evaluate import evaluate_line
+    from .flowlines import flow_candidates, snapped
+
+    suspects = suspects or set()
     tracks_xy = {tid: smooth(pts, smooth_window) for tid, pts in tracks.items()}
-    candidates = generate_candidates(area, width, height, n_candidates, seed)
+    normal_xy = {tid: xy for tid, xy in tracks_xy.items() if tid not in suspects}
+    candidates = flow_candidates(area, normal_xy, width, height, n_candidates)
     if len(candidates) == 0:
         return []
     poly = area.points()
-    margin = 10
-    bbox = (poly[:, 0].min() - margin, poly[:, 1].min() - margin, poly[:, 0].max() + margin, poly[:, 1].max() + margin)
+    pad = 10
+    bbox = (poly[:, 0].min() - pad, poly[:, 1].min() - pad, poly[:, 0].max() + pad, poly[:, 1].max() + pad)
     step = max(2.0, 0.004 * max(width, height))
-    segs = _segments_near(tracks_xy, bbox, step)
+    segs = _segments_near(normal_xy, bbox, step)
     if segs is None:
         return []
     P, Q, starts = segs
+    suspect_segs = _segments_near({t: tracks_xy[t] for t in suspects if t in tracks_xy}, bbox, step)
 
     people = np.zeros(len(candidates), dtype=np.int64)
     total = np.zeros(len(candidates), dtype=np.int64)
+    suspect_hits = np.zeros(len(candidates), dtype=np.int64)
     for i in range(0, len(candidates), CHUNK):
-        people[i : i + CHUNK], total[i : i + CHUNK] = score_lines(candidates[i : i + CHUNK], P, Q, starts)
+        chunk = candidates[i : i + CHUNK]
+        people[i : i + CHUNK], total[i : i + CHUNK] = score_lines(chunk, P, Q, starts)
+        if suspect_segs is not None:
+            suspect_hits[i : i + CHUNK] = score_lines(chunk, *suspect_segs)[0]
         if progress is not None:
             progress(min(i + CHUNK, len(candidates)), len(candidates))
 
+    # 誤判定らしい線が通る候補は使わない（全部に通ってしまう場合だけ、通る本数が最少のものを残す）
+    allowed = suspect_hits == suspect_hits.min()
+    idx_allowed = np.flatnonzero(allowed)
     # 1段目: 高速評価の上位だけ残す（揺れによる見かけの交差を含むので、人数を重視して選ぶ）
-    pre_order = np.lexsort((total - people, -people))
-    pool = pre_order[: min(RESCORE, len(pre_order))]
+    #   人数が同じ線は大量にあるので、同じあたりの線ばかりにならないよう位置を散らして残す
+    separation = max(10.0, 0.2 * np.sqrt(area.polygon_area()))
+    pre_order = idx_allowed[np.lexsort(((total - people)[idx_allowed], -people[idx_allowed]))]
+    all_mids = (candidates[:, 0:2] + candidates[:, 2:4]) / 2
+    pool = _spread(pre_order, all_mids, separation / 8, RESCORE)
     candidates = candidates[pool]
     # 2段目: 実際のカウント処理と同じ方法で数え直す
-    people, duplicates, passes = exact_scores(candidates, tracks, smooth_window, margin, max(1, round(fps * REPEAT_SEC)))
+    normal_tracks = {t: tracks[t] for t in normal_xy}
+    repeat = max(1, round(fps * REPEAT_SEC))
+    people, duplicates, passes = exact_scores(candidates, normal_tracks, smooth_window, margin, repeat)
 
-    score = people - duplicates
-    lengths = np.hypot(candidates[:, 2] - candidates[:, 0], candidates[:, 3] - candidates[:, 1])
-    # 評価値が高い順。同点なら二重カウントが少ない線、さらに短い線（余計な場所を含まない）を優先
-    order = np.lexsort((lengths, duplicates, -score))
-
-    separation = max(10.0, 0.2 * np.sqrt(area.polygon_area()))
+    # 3段目: 上位の信頼度を出し、「人数 × 信頼度」で順位を付ける。
+    # 同じ立ち位置で傾きだけ違う線ばかりにならないよう、位置を少し散らして EVALUATE 本選ぶ
     mids = (candidates[:, 0:2] + candidates[:, 2:4]) / 2
+    prelim = _spread(np.lexsort((duplicates, -(people - duplicates))), mids, separation / 4, EVALUATE)
+    evals = {}
+    for k in prelim:
+        if people[k] > 0:
+            evals[int(k)] = evaluate_line(
+                CountLine(*candidates[k]), tracks, tracks_xy, width, height, fps, margin,
+                suspects=suspects, area_polygon=poly,
+            )
+    if not evals:
+        return []
+    keys = list(evals)
+    final = np.array([people[k] * evals[k].reliability / 100 for k in keys])
+    lengths = np.array([np.hypot(*(candidates[k, 2:4] - candidates[k, 0:2])) for k in keys])
+    order = [keys[i] for i in np.lexsort((lengths, [duplicates[k] for k in keys], -final))]
+
     chosen: list[int] = []
-    for idx in order:
-        if people[idx] == 0:
-            break
-        if all(np.hypot(*(mids[idx] - mids[j])) >= separation for j in chosen):
-            chosen.append(int(idx))
+    for k in order:
+        if all(np.hypot(*(mids[k] - mids[j])) >= separation for j in chosen):
+            chosen.append(k)
             if len(chosen) >= top_k:
                 break
 
-    return [
-        Suggestion(
-            area_index=area_index,
-            rank=rank,
-            line=CountLine(*(round(float(v)) for v in candidates[idx])),
-            people=int(people[idx]),
-            duplicates=int(duplicates[idx]),
-            area_people=area_people,
-            passes=int(passes[idx]),
+    results = []
+    for rank, k in enumerate(chosen, start=1):
+        line, ev = candidates[k], evals[k]
+        n_people, n_dup, n_pass = int(people[k]), int(duplicates[k]), int(passes[k])
+        # 水平・垂直に近い線は、評価が下がらなければ水平・垂直にそろえる（見やすさのため）
+        alt = snapped(line, poly, width, height)
+        if alt is not None:
+            p2, d2, s2 = exact_scores(alt[None, :], normal_tracks, smooth_window, margin, repeat)
+            ev2 = evaluate_line(
+                CountLine(*alt), tracks, tracks_xy, width, height, fps, margin, suspects=suspects, area_polygon=poly
+            )
+            if int(p2[0]) * ev2.reliability >= n_people * ev.reliability:
+                line, ev = alt, ev2
+                n_people, n_dup, n_pass = int(p2[0]), int(d2[0]), int(s2[0])
+        results.append(
+            Suggestion(
+                area_index=area_index,
+                rank=rank,
+                line=CountLine(*(round(float(v)) for v in line)),
+                people=n_people,
+                duplicates=n_dup,
+                area_people=area_people,
+                passes=n_pass,
+                reliability=round(ev.reliability, 1),
+                grade=ev.grade,
+                lower=ev.lower,
+                upper=ev.upper,
+                reasons=ev.reasons,
+            )
         )
-        for rank, idx in enumerate(chosen, start=1)
-    ]
+    return results
 
 
 def save_suggestions_csv(path: Path, suggestions: list[Suggestion], areas: list[Area]) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["area", "kind", "rank", "x1", "y1", "x2", "y2", "people", "passes", "duplicates", "score", "area_people", "coverage"])
+        w.writerow(
+            [
+                "area", "kind", "rank", "x1", "y1", "x2", "y2", "people", "passes", "duplicates",
+                "reliability", "grade", "estimate_low", "estimate_high", "score", "area_people", "coverage", "reasons",
+            ]
+        )
         for s in suggestions:
             kind = areas[s.area_index].kind_label if s.area_index < len(areas) else ""
             ln = s.line
             w.writerow(
                 [
-                    f"E{s.area_index + 1}",
-                    kind,
-                    s.rank,
-                    round(ln.x1),
-                    round(ln.y1),
-                    round(ln.x2),
-                    round(ln.y2),
-                    s.people,
-                    s.passes,
-                    s.duplicates,
-                    s.score,
-                    s.area_people,
-                    f"{s.coverage:.3f}",
+                    f"E{s.area_index + 1}", kind, s.rank, round(ln.x1), round(ln.y1), round(ln.x2), round(ln.y2),
+                    s.people, s.passes, s.duplicates, f"{s.reliability:.0f}", s.grade, s.lower, s.upper,
+                    f"{s.final_score:.1f}", s.area_people, f"{s.coverage:.3f}", "・".join(s.reasons),
                 ]
             )

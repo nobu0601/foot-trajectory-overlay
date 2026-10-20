@@ -104,28 +104,28 @@ def find_crossings(
     if line.length() == 0 or len(xy) < 2:
         return []
     dist = line.signed_distance(xy)
+    # 線から margin より離れた点だけで「どちら側にいるか」を確定させ、確定した側が変わった所だけ調べる
+    # （1点ずつ回すと遅いので、側の入れ替わりを配列でまとめて見つける）
+    confirmed = np.flatnonzero(np.abs(dist) > margin)
+    if len(confirmed) < 2:
+        return []
+    sides = np.sign(dist[confirmed])
+    changes = np.flatnonzero(sides[1:] != sides[:-1])
     crossings: list[Crossing] = []
-    side = 0  # -1: A 側, +1: B 側, 0: 未確定
-    side_index = 0
-    for i, d in enumerate(dist):
-        if abs(d) <= margin:
-            continue
-        new_side = 1 if d > 0 else -1
-        if side != 0 and new_side != side:
-            hit = _first_hit(xy, side_index, i, line)
-            if hit is not None:
-                crossings.append(
-                    Crossing(
-                        line_index=line_index,
-                        track_id=track_id,
-                        frame=points[i].frame,
-                        direction="A->B" if new_side > 0 else "B->A",
-                        x=float(hit[0]),
-                        y=float(hit[1]),
-                    )
+    for c in changes:
+        start, i = int(confirmed[c]), int(confirmed[c + 1])
+        hit = _first_hit(xy, start, i, line)
+        if hit is not None:
+            crossings.append(
+                Crossing(
+                    line_index=line_index,
+                    track_id=track_id,
+                    frame=points[i].frame,
+                    direction="A->B" if sides[c + 1] > 0 else "B->A",
+                    x=float(hit[0]),
+                    y=float(hit[1]),
                 )
-        side = new_side
-        side_index = i
+            )
     return crossings
 
 
@@ -207,12 +207,20 @@ def save_lines(path: Path, lines: list[CountLine]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_counts_csv(path: Path, lines: list[CountLine], counts: list[LineCount]) -> None:
+def save_counts_csv(path: Path, lines: list[CountLine], counts: list[LineCount], evaluations=None) -> None:
+    """線ごとの人数。evaluations（evaluate.LineEvaluation の一覧）があれば信頼度と推定範囲も書く。"""
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["line", "x1", "y1", "x2", "y2", "A->B", "B->A", "total"])
+        head = ["line", "x1", "y1", "x2", "y2", "A->B", "B->A", "total"]
+        if evaluations is not None:
+            head += ["estimate_low", "estimate_high", "reliability", "grade", "reasons"]
+        w.writerow(head)
         for i, (ln, c) in enumerate(zip(lines, counts), start=1):
-            w.writerow([f"L{i}", round(ln.x1), round(ln.y1), round(ln.x2), round(ln.y2), c.a_to_b, c.b_to_a, c.total])
+            row = [f"L{i}", round(ln.x1), round(ln.y1), round(ln.x2), round(ln.y2), c.a_to_b, c.b_to_a, c.total]
+            if evaluations is not None and i - 1 < len(evaluations):
+                ev = evaluations[i - 1]
+                row += [ev.lower, ev.upper, f"{ev.reliability:.0f}", ev.grade, "・".join(ev.reasons)]
+            w.writerow(row)
 
 
 def save_crossings_csv(path: Path, crossings: list[Crossing], fps: float) -> None:

@@ -36,7 +36,9 @@ from .counting import (
 )
 from .areas import AREA_KINDS, Area, detect_areas, load_areas, people_in_area, save_areas
 from .drawing import default_line_width, draw_overlay, filter_short_tracks, smooth
+from .evaluate import LineEvaluation, evaluate_line
 from .export import save_image, save_tracks_csv
+from .suspects import find_suspects
 from .suggest import DEFAULT_CANDIDATES, Suggestion, save_suggestions_csv, suggest_lines
 from .tracking import TrackingResult, TrackPoint, split_at_frame_edges
 
@@ -141,15 +143,22 @@ class Session:
         # 表示用（絞り込みあり）と保存用（全員）の2枚を別々に覚えておく
         self._overlay_cache: dict[bool, tuple[tuple, np.ndarray]] = {}
 
+        self._tracks_xy: dict[int, np.ndarray] | None = None
+        # 誤判定らしい追跡線。利用者が「誤判定ではない」と戻したIDは suspect_ok に入る
+        self._suspects_found: dict[int, list[str]] | None = None
+        self.suspect_ok: set[int] = {int(t) for t in self.meta.get("suspect_ok", [])}
+
         self.lines: list[CountLine] = load_lines(result_dir / "lines.json")
         self.counts: list[LineCount] = []
         self.crossings: list[Crossing] = []
+        self.evaluations: list[LineEvaluation] = []
         self.recount()
 
         self.areas: list[Area] = load_areas(result_dir / "areas.json")
         self.suggestions: list[Suggestion] = load_suggestions(result_dir / "suggestions.json")
         self.show_areas = True
-        self._tracks_xy: dict[int, np.ndarray] | None = None
+        if self.areas and self.lines:
+            self.recount()  # エリアが分かったので、すり抜けをエリアの縁まで見て評価し直す
 
         # 表示する時間帯（秒）。表示だけの絞り込みで、人数の集計や候補提案には使わない
         self.time_start: float = 0.0
@@ -180,6 +189,45 @@ class Session:
 
     def recount(self) -> None:
         self.counts, self.crossings = count_lines(self.tracks, self.lines, self.smooth, self.margin)
+        self.evaluations = [self.evaluate(line) for line in self.lines]
+
+    def evaluate(self, line: CountLine) -> LineEvaluation:
+        """カウント線の信頼度・推定範囲（evaluate.py）。"""
+        mid = (line.p1 + line.p2) / 2
+        area = next((a for a in getattr(self, "areas", []) if a.contains(*mid)), None)
+        return evaluate_line(
+            line,
+            self.tracks,
+            self.tracks_xy,
+            self.width,
+            self.height,
+            self.fps,
+            self.margin,
+            suspects=self.suspects,
+            area_polygon=area.points() if area is not None else None,
+        )
+
+    # ---- 誤判定らしい追跡線 ----
+
+    @property
+    def suspects_found(self) -> dict[int, list[str]]:
+        """検知した誤判定らしい追跡ID → 理由（利用者が戻したものも含む）。"""
+        if self._suspects_found is None:
+            self._suspects_found = find_suspects(self.tracks_xy, self.width, self.height, self.fps)
+        return self._suspects_found
+
+    @property
+    def suspects(self) -> set[int]:
+        """誤判定らしいとして扱う追跡ID（利用者が「誤判定ではない」と戻したものを除く）。"""
+        return set(self.suspects_found) - self.suspect_ok
+
+    def set_suspect_ok(self, track_id: int, ok: bool) -> None:
+        """ok=True: 誤判定ではないとして普通の線に戻す。False: 誤判定らしい線に戻す。"""
+        if ok:
+            self.suspect_ok.add(track_id)
+        else:
+            self.suspect_ok.discard(track_id)
+        self.recount()
 
     def add_line(self, line: CountLine) -> bool:
         if line.length() < MIN_LINE_PX:
@@ -216,6 +264,7 @@ class Session:
     def auto_detect_areas(self) -> None:
         self.areas = detect_areas(self.tracks_xy, self.width, self.height)
         self.suggestions = []
+        self.recount()  # すり抜けの評価はエリアの縁まで見るので、エリアが変わったら評価し直す
 
     def area_people(self, index: int) -> int:
         return people_in_area(self.areas[index], self.tracks_xy, self.width, self.height)
@@ -225,6 +274,7 @@ class Session:
         if len(polygon) < 3 or area.polygon_area() < 25:
             return False
         self.areas.append(area)
+        self.recount()
         return True
 
     def remove_area(self, index: int) -> None:
@@ -239,10 +289,12 @@ class Session:
                     sg.area_index -= 1
                 kept.append(sg)
             self.suggestions = kept
+            self.recount()
 
     def area_changed(self, index: int) -> None:
         """エリアの形が変わったら、そのエリアの古い候補は消す。"""
         self.suggestions = [sg for sg in self.suggestions if sg.area_index != index]
+        self.recount()
 
     def compute_suggestions(
         self,
@@ -278,6 +330,7 @@ class Session:
                 margin=self.margin,
                 fps=self.fps,
                 n_candidates=n_candidates,
+                suspects=self.suspects,
                 top_k=top_k,
                 progress=area_progress,
             )
@@ -298,7 +351,8 @@ class Session:
         """
         filtered = not all_tracks and self.is_time_filtered()
         time_key = (self.time_start, self.time_end) if filtered else None
-        key = (self.line_width, self.show_ids, self.grid, self.dim, time_key)
+        suspects = frozenset(self.suspects)
+        key = (self.line_width, self.show_ids, self.grid, self.dim, time_key, suspects)
         cached = self._overlay_cache.get(filtered)
         if cached is None or cached[0] != key:
             img = draw_overlay(
@@ -309,6 +363,7 @@ class Session:
                 show_ids=self.show_ids,
                 grid=self.grid,
                 line_width=self.line_width,
+                suspects=suspects,
             )
             self._overlay_cache[filtered] = (key, img)
         return self._overlay_cache[filtered][1]
@@ -318,6 +373,8 @@ class Session:
         highlight_area: int | None = None,
         selected_suggestion: int | None = None,
         all_tracks: bool = False,
+        selected_line: int | None = None,
+        highlight_track: int | None = None,
     ) -> np.ndarray:
         """重畳画像に、エリア・候補線・カウント線・通過位置を描いた画像。"""
         img = self.overlay(all_tracks).copy()
@@ -325,8 +382,26 @@ class Session:
         if self.show_areas:
             self.draw_areas(img, highlight=highlight_area)
             self.draw_suggestions(img, thick, selected=selected_suggestion)
+        if highlight_track is not None and highlight_track in self.tracks_xy:
+            # 一覧で選んだ追跡線を白く太く示す
+            pts = np.round(self.tracks_xy[highlight_track]).astype(np.int32)
+            cv2.polylines(img, [pts], False, (0, 0, 0), thick + 4, cv2.LINE_AA)
+            cv2.polylines(img, [pts], False, (255, 255, 255), thick + 2, cv2.LINE_AA)
         for i, line in enumerate(self.lines):
             draw_count_line(img, line, f"L{i + 1}", line_color(i), thick, self.scale)
+        if selected_line is not None and selected_line < len(self.evaluations):
+            # 選んだ線の「途切れ」（橙の×）と「すり抜け」（紫の丸）の位置を示す
+            ev = self.evaluations[selected_line]
+            r = thick + 4
+            for x, y in ev.break_points:
+                c = (round(x), round(y))
+                for color, w in (((0, 0, 0), thick + 3), ((0, 140, 255), thick + 1)):
+                    cv2.line(img, (c[0] - r, c[1] - r), (c[0] + r, c[1] + r), color, w, cv2.LINE_AA)
+                    cv2.line(img, (c[0] - r, c[1] + r), (c[0] + r, c[1] - r), color, w, cv2.LINE_AA)
+            for x, y in ev.bypass_points:
+                c = (round(x), round(y))
+                cv2.circle(img, c, r, (0, 0, 0), thick + 3, cv2.LINE_AA)
+                cv2.circle(img, c, r, (255, 80, 200), thick + 1, cv2.LINE_AA)
         # 通過した位置の印（線の上に描いて、どこで数えたか見えるようにする）
         for c in self.crossings:
             center = (round(c.x), round(c.y))
@@ -407,12 +482,17 @@ class Session:
         if not self.lines:
             rows.append(("No count lines", (200, 200, 200)))
         for i, c in enumerate(self.counts):
-            rows.append((f"L{i + 1}   A->B: {c.a_to_b}   B->A: {c.b_to_a}   Total: {c.total}", line_color(i)))
+            text = f"L{i + 1}   A->B: {c.a_to_b}   B->A: {c.b_to_a}   Total: {c.total}"
+            if i < len(self.evaluations):
+                ev = self.evaluations[i]
+                text += f"   (estimate {ev.lower}-{ev.upper}, reliability {ev.reliability:.0f} {ev.grade})"
+            rows.append((text, line_color(i)))
         return self._with_footer(img, rows)
 
     # ---- 保存 ----
 
     def save(self) -> None:
+        self.meta["suspect_ok"] = sorted(self.suspect_ok)
         self.meta["view"] = {
             "line_width": self.line_width,
             "show_ids": self.show_ids,
@@ -422,7 +502,7 @@ class Session:
         (self.dir / "meta.json").write_text(json.dumps(self.meta, ensure_ascii=False, indent=2), encoding="utf-8")
         save_image(self.dir / "overlay.png", self.overlay(all_tracks=True))
         save_lines(self.dir / "lines.json", self.lines)
-        save_counts_csv(self.dir / "counts.csv", self.lines, self.counts)
+        save_counts_csv(self.dir / "counts.csv", self.lines, self.counts, self.evaluations)
         save_crossings_csv(self.dir / "crossings.csv", self.crossings, self.fps)
         save_image(self.dir / "count_result.png", self.render_with_summary())
         save_areas(self.dir / "areas.json", self.areas)
@@ -437,7 +517,16 @@ class Session:
     def summary_lines(self) -> list[str]:
         if not self.lines:
             return ["カウント線: なし"]
-        return [f"L{i}: A→B {c.a_to_b}人 / B→A {c.b_to_a}人 / 合計 {c.total}人" for i, c in enumerate(self.counts, 1)]
+        out = []
+        for i, c in enumerate(self.counts, 1):
+            text = f"L{i}: A→B {c.a_to_b}人 / B→A {c.b_to_a}人 / 合計 {c.total}人"
+            if i - 1 < len(self.evaluations):
+                ev = self.evaluations[i - 1]
+                text += f"（推定 {ev.range_text}人、信頼度 {ev.reliability:.0f}点 {ev.grade}）"
+                if ev.reasons:
+                    text += f" 理由: {'・'.join(ev.reasons)}"
+            out.append(text)
+        return out
 
 
 class SuggestionCancelled(Exception):
@@ -457,6 +546,11 @@ def load_suggestions(path: Path) -> list[Suggestion]:
             duplicates=d["duplicates"],
             area_people=d["area_people"],
             passes=d.get("passes", 0),
+            reliability=d.get("reliability", 0.0),
+            grade=d.get("grade", ""),
+            lower=d.get("lower", 0),
+            upper=d.get("upper", 0),
+            reasons=d.get("reasons", []),
         )
         for d in data.get("suggestions", [])
     ]

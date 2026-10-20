@@ -78,6 +78,8 @@ class App(tk.Tk):
         self.save_job: str | None = None
         self.stop_event: threading.Event | None = None
         self.selected_area: int | None = None
+        self.selected_line: int | None = None
+        self.selected_suspect: int | None = None
         self.selected_suggestion: int | None = None
         self.area_draft: list[tuple[float, float]] | None = None  # 手で追加中のエリアの頂点
         self.drag: tuple[int, int] | None = None  # ドラッグ中の (エリア番号, 頂点番号)
@@ -136,9 +138,12 @@ class App(tk.Tk):
         area_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(count_tab, text="カウント線")
         self.notebook.add(area_tab, text="エリア・候補提案")
+        suspect_tab = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(suspect_tab, text="誤判定の疑い")
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         self._build_count_panel(count_tab)
         self._build_area_panel(area_tab)
+        self._build_suspect_panel(suspect_tab)
 
         statusbar = ttk.Frame(self, padding=(8, 4))
         statusbar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -206,12 +211,19 @@ class App(tk.Tk):
             justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(0, 6))
 
-        columns = ("line", "ab", "ba", "total")
-        self.table = ttk.Treeview(box, columns=columns, show="headings", height=8, selectmode="browse")
-        for col, text, width in zip(columns, ("線", "A→B", "B→A", "合計"), (50, 70, 70, 70)):
+        columns = ("line", "ab", "ba", "total", "range", "rel")
+        self.table = ttk.Treeview(box, columns=columns, show="headings", height=6, selectmode="browse")
+        for col, text, width in zip(
+            columns, ("線", "A→B", "B→A", "合計", "推定範囲", "信頼度"), (40, 50, 50, 50, 75, 70)
+        ):
             self.table.heading(col, text=text)
             self.table.column(col, width=width, anchor=tk.CENTER)
         self.table.pack(fill=tk.BOTH, expand=True)
+        self.table.bind("<<TreeviewSelect>>", self.on_line_select)
+        self.line_detail_var = tk.StringVar(value="線を選ぶと、信頼度の内訳と直し方を表示します。")
+        ttk.Label(box, textvariable=self.line_detail_var, justify=tk.LEFT, wraplength=350).pack(
+            anchor=tk.W, fill=tk.X, pady=(6, 0)
+        )
 
         buttons = ttk.Frame(box)
         buttons.pack(fill=tk.X, pady=(6, 0))
@@ -262,9 +274,11 @@ class App(tk.Tk):
         self.btn_suggest = ttk.Button(box, text="カウント線の候補を提案（各エリア上位3本）", command=self.start_suggest)
         self.btn_suggest.pack(fill=tk.X)
 
-        cols = ("cand", "people", "rate", "passes", "dup")
+        cols = ("cand", "people", "rate", "passes", "dup", "rel")
         self.suggest_table = ttk.Treeview(box, columns=cols, show="headings", height=6, selectmode="browse")
-        for col, text, width in zip(cols, ("候補", "数えた人", "割合", "通過回数", "二重"), (60, 75, 55, 75, 45)):
+        for col, text, width in zip(
+            cols, ("候補", "数えた人", "割合", "通過", "二重", "信頼度"), (55, 60, 45, 50, 40, 70)
+        ):
             self.suggest_table.heading(col, text=text)
             self.suggest_table.column(col, width=width, anchor=tk.CENTER)
         self.suggest_table.pack(fill=tk.X, pady=(6, 0))
@@ -274,9 +288,76 @@ class App(tk.Tk):
         self.btn_adopt.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(
             box,
-            text="割合: エリアを通った人のうち数えた割合\n通過回数: 往復は2回 / 二重: 1秒以内の重複",
+            text="順位: 数えた人 × 信頼度。誤判定らしい線が通る位置は除外\n"
+            "割合: エリアを通った人のうち数えた割合 / 通過: 往復は2回",
             justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(4, 0))
+
+    def _build_suspect_panel(self, box) -> None:
+        ttk.Label(
+            box,
+            text="追跡線の様子から誤判定らしい線を見つけ、灰色の点線で表示します。\n"
+            "カウント線の候補は、これらの線が通らない位置に引きます。\n"
+            "誤判定ではない線は、選んで「誤判定ではない」に戻せます。",
+            justify=tk.LEFT,
+            wraplength=350,
+        ).pack(anchor=tk.W, pady=(0, 6))
+        cols = ("id", "reason", "state")
+        self.suspect_table = ttk.Treeview(box, columns=cols, show="headings", height=10, selectmode="browse")
+        for col, text, width in zip(cols, ("追跡ID", "理由", "扱い"), (60, 190, 90)):
+            self.suspect_table.heading(col, text=text)
+            self.suspect_table.column(col, width=width, anchor=tk.CENTER)
+        self.suspect_table.pack(fill=tk.BOTH, expand=True)
+        self.suspect_table.bind("<<TreeviewSelect>>", self.on_suspect_select)
+        self.btn_toggle_suspect = ttk.Button(box, text="選んだ線を「誤判定ではない」に戻す", command=self.toggle_suspect)
+        self.btn_toggle_suspect.pack(fill=tk.X, pady=(6, 0))
+        self.suspect_count_var = tk.StringVar(value="")
+        ttk.Label(box, textvariable=self.suspect_count_var).pack(anchor=tk.W, pady=(4, 0))
+
+    def refresh_suspect_table(self) -> None:
+        self.suspect_table.delete(*self.suspect_table.get_children())
+        s = self.session
+        if s is None:
+            self.suspect_count_var.set("")
+            return
+        from .suspects import reason_text
+
+        found = s.suspects_found
+        for tid in sorted(found):
+            state = "誤判定ではない" if tid in s.suspect_ok else "誤判定らしい"
+            self.suspect_table.insert("", tk.END, iid=str(tid), values=(tid, reason_text(found[tid]), state))
+        if self.selected_suspect is not None and str(self.selected_suspect) in self.suspect_table.get_children():
+            self.suspect_table.selection_set(str(self.selected_suspect))
+        self.suspect_count_var.set(f"誤判定らしい線: {len(s.suspects)}本 / 全{len(s.tracks)}本")
+        self._update_toggle_label()
+
+    def _update_toggle_label(self) -> None:
+        s = self.session
+        if s is not None and self.selected_suspect in s.suspect_ok:
+            self.btn_toggle_suspect.config(text="選んだ線を「誤判定らしい」に戻す")
+        else:
+            self.btn_toggle_suspect.config(text="選んだ線を「誤判定ではない」に戻す")
+
+    def on_suspect_select(self, _event=None) -> None:
+        sel = self.suspect_table.selection()
+        if not sel:
+            return
+        self.selected_suspect = int(sel[0])
+        self._update_toggle_label()
+        self.render_dirty = True
+        self.schedule_redraw()
+
+    def toggle_suspect(self) -> None:
+        s = self.session
+        if s is None or self.selected_suspect is None:
+            messagebox.showinfo(APP_TITLE, "一覧から線を選んでください。")
+            return
+        tid = self.selected_suspect
+        s.set_suspect_ok(tid, tid not in s.suspect_ok)
+        self.refresh_suspect_table()
+        self.lines_changed()  # 人数の信頼度が変わるので表を更新して保存する
+        if s.suggestions:
+            self.status_var.set("誤判定の扱いを変えました。候補線に反映するには、もう一度「候補を提案」してください。")
 
     # ================= 開く・解析 =================
 
@@ -320,8 +401,11 @@ class App(tk.Tk):
         self.reset_area_state()
         self.render_dirty = True
         self.rendered = read_first_frame(video)  # 解析中は最初のフレームを表示しておく
+        self.selected_line = None
+        self.selected_suspect = None
         self.refresh_table()
         self.refresh_area_tables()
+        self.refresh_suspect_table()
         self.canvas.delete("all")
         self.schedule_redraw()
         self._set_busy(True)
@@ -436,8 +520,11 @@ class App(tk.Tk):
         self._setting_time = False
         self._update_view_labels()
         self.render_dirty = True
+        self.selected_line = None
+        self.selected_suspect = None
         self.refresh_table()
         self.refresh_area_tables()
+        self.refresh_suspect_table()
         self.schedule_redraw()
         self.schedule_save()
         self.status_var.set(f"{result_dir} を開きました。画像を2回クリックしてカウント線を引いてください。")
@@ -567,9 +654,9 @@ class App(tk.Tk):
         return ix * self.view_scale + self.view_offset[0], iy * self.view_scale + self.view_offset[1]
 
     def mode(self) -> str:
-        """右側で開いているタブ: "lines"（カウント線）または "areas"（エリア・候補提案）。"""
+        """右側で開いているタブ: "lines"（カウント線）/ "areas"（エリア・候補提案）/ "suspects"（誤判定の疑い）。"""
         try:
-            return "areas" if self.notebook.index(self.notebook.select()) == 1 else "lines"
+            return {1: "areas", 2: "suspects"}.get(self.notebook.index(self.notebook.select()), "lines")
         except tk.TclError:
             return "lines"
 
@@ -587,6 +674,8 @@ class App(tk.Tk):
         if self.mode() == "areas":
             self.on_area_click(event)
             return
+        if self.mode() == "suspects":
+            return  # 「誤判定の疑い」タブでは画像のクリックで線を引かない
         point = self.to_image(event.x, event.y)
         if point is None:
             return
@@ -653,6 +742,7 @@ class App(tk.Tk):
             messagebox.showinfo(APP_TITLE, "表から削除する線を選んでください。")
             return
         self.session.remove_line(self.table.index(selected[0]))
+        self.selected_line = None
         self.lines_changed()
 
     def clear_lines(self) -> None:
@@ -673,8 +763,42 @@ class App(tk.Tk):
         if self.session is None:
             return
         for i, c in enumerate(self.session.counts, start=1):
-            self.table.insert("", tk.END, values=(f"L{i}", c.a_to_b, c.b_to_a, c.total))
+            ev = self.session.evaluations[i - 1] if i - 1 < len(self.session.evaluations) else None
+            extra = (f"{ev.range_text}人", f"{ev.reliability:.0f}点 {ev.grade}") if ev else ("", "")
+            self.table.insert("", tk.END, values=(f"L{i}", c.a_to_b, c.b_to_a, c.total, *extra))
+        if self.selected_line is not None and self.selected_line < len(self.session.lines):
+            self.table.selection_set(self.table.get_children()[self.selected_line])
+        else:
+            self.selected_line = None
+        self.update_line_detail()
 
+    def on_line_select(self, _event=None) -> None:
+        sel = self.table.selection()
+        if not sel or self.session is None:
+            return
+        index = self.table.index(sel[0])
+        if index != self.selected_line:
+            self.selected_line = index
+            self.update_line_detail()
+            self.render_dirty = True
+            self.schedule_redraw()
+
+    def update_line_detail(self) -> None:
+        """選んだカウント線の信頼度の内訳（低い理由と直し方）を表示する。"""
+        s = self.session
+        if s is None or self.selected_line is None or self.selected_line >= len(s.evaluations):
+            self.line_detail_var.set("線を選ぶと、信頼度の内訳と直し方を表示します。")
+            return
+        ev = s.evaluations[self.selected_line]
+        text = f"L{self.selected_line + 1}: {ev.summary}"
+        if ev.reasons:
+            for reason, hint in zip(ev.reasons, ev.hints):
+                text += f"\n・{reason}\n　→ {hint}"
+        else:
+            text += "\n数え間違いの痕跡はほとんどありません。"
+        if ev.break_points or ev.bypass_points:
+            text += "\n画像の印: 橙の× = 追跡が途切れた所\n　　　　　紫の○ = 線の端の外をすり抜けた所"
+        self.line_detail_var.set(text)
     # ================= エリア・候補提案 =================
 
     def reset_area_state(self) -> None:
@@ -685,6 +809,7 @@ class App(tk.Tk):
 
     def areas_changed(self) -> None:
         self.refresh_area_tables()
+        self.refresh_table()  # カウント線の信頼度はエリアの形でも変わる
         self.render_dirty = True
         self.schedule_redraw()
         self.schedule_save()
@@ -706,6 +831,7 @@ class App(tk.Tk):
                     f"{sg.coverage:.0%}",
                     f"{sg.passes}回",
                     sg.duplicates,
+                    f"{sg.reliability:.0f}点 {sg.grade}" if sg.grade else "",
                 ),
             )
         if self.selected_area is not None and self.selected_area < len(self.session.areas):
@@ -944,7 +1070,12 @@ class App(tk.Tk):
         if self.session is None and self.rendered is None:
             return
         if self.session is not None and (self.render_dirty or self.rendered is None):
-            self.rendered = self.session.render(self.selected_area, self.selected_suggestion)
+            self.rendered = self.session.render(
+                self.selected_area,
+                self.selected_suggestion,
+                selected_line=self.selected_line,
+                highlight_track=self.selected_suspect,
+            )
             self.render_dirty = False
         cw, ch = max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1)
         h, w = self.rendered.shape[:2]
@@ -993,6 +1124,7 @@ class App(tk.Tk):
             self.btn_folder,
             self.btn_batch,
             self.btn_save_view,
+            self.btn_toggle_suspect,
             self.btn_detect,
             self.btn_add_area,
             self.btn_del_area,
