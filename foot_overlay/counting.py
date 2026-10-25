@@ -1,7 +1,8 @@
 """カウント線をまたいだ人数を数える。
 
-線は P1→P2 の線分。線の左右を A 側 / B 側と呼び、
-A→B と B→A の向き別に、またいだ回数を数える。
+線は P1（始点）→P2（終点）の線分。始点→終点の向きに立って左側を A 側、右側を B 側と呼び
+（画像の座標は y が下向き）、A→B を「IN」、B→A を「OUT」として向き別に数える。
+IN と OUT を入れ替えたいときは、始点と終点を入れ替える（CountLine.reversed）。
 """
 
 from __future__ import annotations
@@ -25,6 +26,20 @@ class CountLine:
     y1: float
     x2: float
     y2: float
+    name: str = ""  # 線の名前（例: 改札口）。空なら「L1」のように番号で呼ぶ
+
+    def label(self, index: int) -> str:
+        """表示用の名前（名前がなければ L1, L2…）。"""
+        return self.name or f"L{index + 1}"
+
+    def reversed(self) -> "CountLine":
+        """始点と終点を入れ替えた線（IN と OUT が入れ替わる）。"""
+        return CountLine(self.x2, self.y2, self.x1, self.y1, self.name)
+
+    def in_direction(self) -> tuple[float, float]:
+        """IN として数える移動の向き（単位ベクトル、画像の座標で y は下向き）。"""
+        n = self.normal()
+        return float(n[0]), float(n[1])
 
     @property
     def p1(self) -> np.ndarray:
@@ -54,19 +69,19 @@ class Crossing:
     line_index: int
     track_id: int
     frame: int
-    direction: str  # "A->B" または "B->A"
+    direction: str  # "IN"（A側→B側）または "OUT"（B側→A側）
     x: float
     y: float
 
 
 @dataclass
 class LineCount:
-    a_to_b: int = 0
-    b_to_a: int = 0
+    in_count: int = 0
+    out_count: int = 0
 
     @property
     def total(self) -> int:
-        return self.a_to_b + self.b_to_a
+        return self.in_count + self.out_count
 
 
 def segments_intersect(p: np.ndarray, q: np.ndarray, a: np.ndarray, b: np.ndarray) -> bool:
@@ -121,7 +136,7 @@ def find_crossings(
                     line_index=line_index,
                     track_id=track_id,
                     frame=points[i].frame,
-                    direction="A->B" if sides[c + 1] > 0 else "B->A",
+                    direction="IN" if sides[c + 1] > 0 else "OUT",
                     x=float(hit[0]),
                     y=float(hit[1]),
                 )
@@ -158,10 +173,10 @@ def count_lines(
         for tid in sorted(tracks):
             for c in find_crossings(line, li, tid, tracks[tid], smoothed[tid], margin):
                 crossings.append(c)
-                if c.direction == "A->B":
-                    counts[li].a_to_b += 1
+                if c.direction == "IN":
+                    counts[li].in_count += 1
                 else:
-                    counts[li].b_to_a += 1
+                    counts[li].out_count += 1
     return counts, crossings
 
 
@@ -208,29 +223,98 @@ def save_lines(path: Path, lines: list[CountLine]) -> None:
 
 
 def save_counts_csv(path: Path, lines: list[CountLine], counts: list[LineCount], evaluations=None) -> None:
-    """線ごとの人数。evaluations（evaluate.LineEvaluation の一覧）があれば信頼度と推定範囲も書く。"""
+    """線ごとの人数。evaluations（evaluate.LineEvaluation の一覧）があれば信頼度・推定範囲・重複も書く。"""
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        head = ["line", "x1", "y1", "x2", "y2", "A->B", "B->A", "total"]
+        head = ["line", "x1", "y1", "x2", "y2", "IN", "OUT", "total"]
         if evaluations is not None:
-            head += ["estimate_low", "estimate_high", "reliability", "grade", "reasons"]
+            head += ["duplicates", "estimate_low", "estimate_high", "reliability", "grade", "reasons"]
         w.writerow(head)
-        for i, (ln, c) in enumerate(zip(lines, counts), start=1):
-            row = [f"L{i}", round(ln.x1), round(ln.y1), round(ln.x2), round(ln.y2), c.a_to_b, c.b_to_a, c.total]
-            if evaluations is not None and i - 1 < len(evaluations):
-                ev = evaluations[i - 1]
-                row += [ev.lower, ev.upper, f"{ev.reliability:.0f}", ev.grade, "・".join(ev.reasons)]
+        for i, (ln, c) in enumerate(zip(lines, counts)):
+            row = [ln.label(i), round(ln.x1), round(ln.y1), round(ln.x2), round(ln.y2), c.in_count, c.out_count, c.total]
+            if evaluations is not None and i < len(evaluations):
+                ev = evaluations[i]
+                row += [ev.duplicates, ev.lower, ev.upper, f"{ev.reliability:.0f}", ev.grade, "・".join(ev.reasons)]
             w.writerow(row)
 
 
-def save_crossings_csv(path: Path, crossings: list[Crossing], fps: float) -> None:
+def save_crossings_csv(path: Path, crossings: list[Crossing], fps: float, lines: list[CountLine] | None = None) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["line", "track_id", "frame", "time_sec", "direction", "x", "y"])
         for c in sorted(crossings, key=lambda c: (c.line_index, c.frame, c.track_id)):
-            w.writerow(
-                [f"L{c.line_index + 1}", c.track_id, c.frame, f"{c.frame / fps:.3f}", c.direction, f"{c.x:.1f}", f"{c.y:.1f}"]
-            )
+            name = lines[c.line_index].label(c.line_index) if lines and c.line_index < len(lines) else f"L{c.line_index + 1}"
+            w.writerow([name, c.track_id, c.frame, f"{c.frame / fps:.3f}", c.direction, f"{c.x:.1f}", f"{c.y:.1f}"])
+
+
+# ---- カウント線の書き出し・読み込み（JSON） ----
+
+LINES_JSON_FORMAT = "foot-trajectory-overlay/count-lines"
+
+
+def export_lines_json(path: Path, lines: list[CountLine], width: int, height: int, video: str = "") -> None:
+    """カウント線の情報（名前・始点終点の座標・IN の向き）を JSON に書き出す。
+
+    座標は画像のピクセル（左上が原点、x は右向き、y は下向き）。
+    IN = 始点→終点を向いて左側から右側へ通過すること。in_direction はその移動の向き（単位ベクトル）。
+    """
+    data = {
+        "format": LINES_JSON_FORMAT,
+        "version": 1,
+        "video": video,
+        "image": {"width": width, "height": height},
+        "coordinates": "pixel; origin top-left; x right, y down",
+        "in_rule": "IN = crossing from the left side to the right side of start->end",
+        "lines": [
+            {
+                "name": ln.label(i),
+                "start": {"x": round(ln.x1, 1), "y": round(ln.y1, 1)},
+                "end": {"x": round(ln.x2, 1), "y": round(ln.y2, 1)},
+                "in_direction": {"x": round(ln.in_direction()[0], 4), "y": round(ln.in_direction()[1], 4)},
+            }
+            for i, ln in enumerate(lines)
+        ],
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def scale_lines(lines: list[CountLine], from_w: int, from_h: int, to_w: int, to_h: int) -> list[CountLine]:
+    """画像の大きさが違う動画へ線を移すときに、座標を大きさの比で合わせる（名前と向きはそのまま）。"""
+    sx = to_w / from_w if from_w else 1.0
+    sy = to_h / from_h if from_h else 1.0
+    return [CountLine(ln.x1 * sx, ln.y1 * sy, ln.x2 * sx, ln.y2 * sy, ln.name) for ln in lines]
+
+
+def import_lines_json(path: Path, width: int, height: int) -> tuple[list[CountLine], str]:
+    """export_lines_json で書き出した JSON を読み込む。
+
+    書き出したときと画像の大きさが違えば、座標を大きさの比で拡大・縮小する。
+    戻り値の2つ目は利用者向けの注意書き（なければ空）。
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("format") != LINES_JSON_FORMAT or "lines" not in data:
+        raise ValueError("このツールで書き出したカウント線の JSON ではありません。")
+    img = data.get("image") or {}
+    sx = width / img["width"] if img.get("width") else 1.0
+    sy = height / img["height"] if img.get("height") else 1.0
+    lines = []
+    for d in data["lines"]:
+        ln = CountLine(
+            float(d["start"]["x"]) * sx,
+            float(d["start"]["y"]) * sy,
+            float(d["end"]["x"]) * sx,
+            float(d["end"]["y"]) * sy,
+            str(d.get("name", "")),
+        )
+        # 向きは始点・終点の並びで決まる。in_direction と逆なら入れ替える（手で編集された JSON のため）
+        want = d.get("in_direction")
+        if want and (ln.in_direction()[0] * want["x"] + ln.in_direction()[1] * want["y"]) < 0:
+            ln = ln.reversed()
+        lines.append(ln)
+    note = ""
+    if abs(sx - 1) > 1e-6 or abs(sy - 1) > 1e-6:
+        note = f"画像の大きさが違うため（{img.get('width')}×{img.get('height')} → {width}×{height}）、座標を拡大・縮小しました。"
+    return lines, note
 
 
 def parse_line_arg(text: str) -> CountLine:

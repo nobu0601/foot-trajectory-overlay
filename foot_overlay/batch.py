@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import shutil
 import sys
 import threading
@@ -146,6 +147,58 @@ def write_summary(path: Path, results: list[BatchResult]) -> None:
         for r in results:
             image = f"{r.item.name}.png" if r.status in ("完了", "スキップ（解析済み）") else ""
             w.writerow([str(r.item.video), image, r.status, r.people, r.frames, f"{r.seconds:.0f}", r.message])
+
+
+# ---- 連続設定・全動画の一覧 ----
+
+
+def find_result_dirs(root: Path) -> list[Path]:
+    """フォルダの中（サブフォルダも含む）にある解析結果（tracks.csv のあるフォルダ）を名前順に返す。"""
+    if (root / "tracks.csv").is_file():
+        return [root]
+    return sorted({p.parent for p in root.rglob("tracks.csv")}, key=lambda p: str(p).lower())
+
+
+SUMMARY_HEADER = [
+    "動画", "結果フォルダ", "線", "IN", "OUT", "合計", "重複", "推定下限", "推定上限", "信頼度", "評価", "理由",
+]
+
+
+def write_all_counts(path: Path, result_dirs: list[Path]) -> int:
+    """全動画・全カウント線の人数を1つの CSV にまとめる。線のない動画も1行出す（設定漏れが分かるように）。
+
+    各結果フォルダの counts.csv（アプリが自動保存したもの）を読んで集めるので速い。戻り値は書いた行数。
+    """
+    rows = []
+    for d in result_dirs:
+        meta_video = d.name[: -len("_overlay")] if d.name.endswith("_overlay") else d.name
+        try:
+            meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+            meta_video = meta.get("video", meta_video)
+        except (OSError, ValueError):
+            pass
+        counts = d / "counts.csv"
+        lines = []
+        if counts.is_file():
+            with counts.open(encoding="utf-8-sig", newline="") as f:
+                lines = list(csv.DictReader(f))
+        if not lines:
+            rows.append([meta_video, str(d), "（カウント線なし）", "", "", "", "", "", "", "", "", ""])
+            continue
+        for r in lines:
+            rows.append(
+                [
+                    meta_video, str(d), r.get("line", ""),
+                    r.get("IN", r.get("A->B", "")), r.get("OUT", r.get("B->A", "")), r.get("total", ""),
+                    r.get("duplicates", ""), r.get("estimate_low", ""), r.get("estimate_high", ""),
+                    r.get("reliability", ""), r.get("grade", ""), r.get("reasons", ""),
+                ]
+            )
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(SUMMARY_HEADER)
+        w.writerows(rows)
+    return len(rows)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -251,6 +251,7 @@ def suggest_lines(
     seed: int = 0,
     progress: ProgressCallback | None = None,
     suspects: set[int] | None = None,
+    repeat_sec: float = REPEAT_SEC,
 ) -> list[Suggestion]:
     """1つのエリアについて、カウント線の候補を最大 top_k 本返す。
 
@@ -301,7 +302,7 @@ def suggest_lines(
     candidates = candidates[pool]
     # 2段目: 実際のカウント処理と同じ方法で数え直す
     normal_tracks = {t: tracks[t] for t in normal_xy}
-    repeat = max(1, round(fps * REPEAT_SEC))
+    repeat = max(1, round(fps * repeat_sec))
     people, duplicates, passes = exact_scores(candidates, normal_tracks, smooth_window, margin, repeat)
 
     # 3段目: 上位の信頼度を出し、「人数 × 信頼度」で順位を付ける。
@@ -313,7 +314,7 @@ def suggest_lines(
         if people[k] > 0:
             evals[int(k)] = evaluate_line(
                 CountLine(*candidates[k]), tracks, tracks_xy, width, height, fps, margin,
-                suspects=suspects, area_polygon=poly,
+                suspects=suspects, area_polygon=poly, repeat_sec=repeat_sec,
             )
     if not evals:
         return []
@@ -338,7 +339,8 @@ def suggest_lines(
         if alt is not None:
             p2, d2, s2 = exact_scores(alt[None, :], normal_tracks, smooth_window, margin, repeat)
             ev2 = evaluate_line(
-                CountLine(*alt), tracks, tracks_xy, width, height, fps, margin, suspects=suspects, area_polygon=poly
+                CountLine(*alt), tracks, tracks_xy, width, height, fps, margin, suspects=suspects, area_polygon=poly,
+                repeat_sec=repeat_sec,
             )
             if int(p2[0]) * ev2.reliability >= n_people * ev.reliability:
                 line, ev = alt, ev2

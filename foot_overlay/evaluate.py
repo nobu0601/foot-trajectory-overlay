@@ -15,7 +15,7 @@ import numpy as np
 from .counting import CountLine, Crossing, find_crossings
 from .tracking import TrackPoint
 
-REPEAT_SEC = 1.0  # この秒数以内のまたぎ直しは二重カウント
+REPEAT_SEC = 1.0  # この秒数以内のまたぎ直しは二重カウント（画面で変えられる。既定値）
 DWELL_SEC = 2.0  # 帯の中にこれ以上いたら「滞留」
 SHALLOW_DEG = 30.0  # 線となす角がこれ未満なら「浅い角度」
 END_FRACTION = 0.10  # 線の両端からこの割合以内なら「端ぎりぎり」
@@ -58,6 +58,7 @@ class LineEvaluation:
     upper: int  # 推定範囲の上限
     reasons: list[str] = field(default_factory=list)  # 信頼度が低い理由（上位2つ）
     suspect_passes: int = 0  # 誤判定らしい線の通過回数
+    duplicates: int = 0  # 同じ人を短時間（repeat_sec 秒以内）に重ねて数えた回数
     hints: list[str] = field(default_factory=list)  # その直し方
     break_points: list[tuple[float, float]] = field(default_factory=list)  # 線の近くで途切れた位置
     bypass_points: list[tuple[float, float]] = field(default_factory=list)  # すり抜けた位置
@@ -166,6 +167,7 @@ def evaluate_line(
     stability: bool = True,
     suspects: set[int] | None = None,
     area_polygon: np.ndarray | None = None,
+    repeat_sec: float = REPEAT_SEC,
 ) -> LineEvaluation:
     """1本のカウント線の信頼度を評価する。
 
@@ -196,7 +198,7 @@ def evaluate_line(
     crossed_ids = sorted({c.track_id for c in crossings})
     people = len(crossed_ids)
     n = max(passes, 1)
-    repeat_frames = max(1, round(fps * REPEAT_SEC))
+    repeat_frames = max(1, round(fps * repeat_sec))
 
     # 4. 二重カウント: 同じ人が repeat_frames 以内にまたぎ直した回数
     duplicates = 0
@@ -309,4 +311,5 @@ def evaluate_line(
         break_points=break_points,
         bypass_points=bypass_points,
         suspect_passes=suspect_passes,
+        duplicates=duplicates,
     )

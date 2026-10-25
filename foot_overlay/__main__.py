@@ -48,6 +48,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="カウント線を座標で指定する（複数回指定可）。線をまたいだ人数を数えて保存する",
     )
     p.add_argument(
+        "--lines-json",
+        type=Path,
+        metavar="JSON",
+        help="アプリで書き出したカウント線の JSON を読み込んで数える（画像の大きさが違えば座標を合わせる）",
+    )
+    p.add_argument(
         "--suggest",
         nargs="?",
         type=int,
@@ -141,6 +147,13 @@ def main(argv: list[str] | None = None) -> int:
                 suggest(path, args.suggest)
             if args.line:
                 count_with_lines(path, args.line, args)
+            if args.lines_json:
+                session = Session(path)
+                note = session.import_lines(args.lines_json)
+                session.save()
+                print(f"\n▶ カウント結果（{path.name}・{args.lines_json.name} の線）{note}")
+                for text in session.summary_lines():
+                    print(f"  {text}")
         except Exception as e:  # 1本失敗しても残りは処理する
             print(f"\n✖ {path.name} の処理に失敗しました: {e}", file=sys.stderr)
             failed += 1

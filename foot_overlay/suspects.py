@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
@@ -28,8 +29,39 @@ OFFPATH_SHARE = 0.7  # 線の点のうち、この割合以上が「他に誰も
 OFFPATH_MIN_TRACKS = 10  # 追跡線がこれより少ない動画では判定しない（比べる相手が少ない）
 
 
-def find_suspects(tracks_xy: dict[int, np.ndarray], width: int, height: int, fps: float = 30.0) -> dict[int, list[str]]:
+@dataclass
+class SuspectSettings:
+    """誤判定の判定基準（「誤判定の疑い」の画面で変えられる。meta.json に保存）。"""
+
+    jump_on: bool = True
+    jump_factor: float = JUMP_FACTOR  # 普通の動きの何倍以上で瞬間移動とみなすか
+    zigzag_on: bool = True
+    zigzag_straightness: float = ZIGZAG_STRAIGHTNESS  # 1秒ごとの前進率がこれ未満ならじぐざぐ
+    offpath_on: bool = True
+    offpath_share: float = OFFPATH_SHARE  # 線の何割以上が誰も通らない場所ならば対象か
+    offpath_min_tracks: int = OFFPATH_MIN_TRACKS  # 追跡線が何本以上の動画で判定するか
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "SuspectSettings":
+        base = cls()
+        for k, v in (d or {}).items():
+            if hasattr(base, k):
+                setattr(base, k, type(getattr(base, k))(v))
+        return base
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def find_suspects(
+    tracks_xy: dict[int, np.ndarray],
+    width: int,
+    height: int,
+    fps: float = 30.0,
+    settings: SuspectSettings | None = None,
+) -> dict[int, list[str]]:
     """誤判定らしい追跡ID → 理由のキー（REASONS のキー）の一覧。"""
+    cfg = settings or SuspectSettings()
     size = max(width, height)
     out: dict[int, list[str]] = {}
 
@@ -38,24 +70,24 @@ def find_suspects(tracks_xy: dict[int, np.ndarray], width: int, height: int, fps
     moving = np.concatenate(steps) if steps else np.zeros(0)
     moving = moving[moving > 0.2]
     typical = float(np.median(moving)) if len(moving) else 1.0
-    jump_limit = max(JUMP_FACTOR * typical, JUMP_MIN_RATIO * size)
+    jump_limit = max(cfg.jump_factor * typical, JUMP_MIN_RATIO * size)
 
     for tid, xy in tracks_xy.items():
         if len(xy) < 2:
             continue
         step = np.hypot(*np.diff(xy, axis=0).T)
-        if step.max() >= jump_limit:
+        if cfg.jump_on and step.max() >= jump_limit:
             out.setdefault(tid, []).append("jump")
         # じぐざぐ: 線全体ではなく1秒ごとに見る（行って戻った人は、各区間ではまっすぐ歩いている）
         w = max(2, round(fps))
-        if len(xy) > w:
+        if cfg.zigzag_on and len(xy) > w:
             path = np.convolve(step, np.ones(w), mode="valid")  # 各1秒区間の道のり
             net = np.hypot(*(xy[w:] - xy[:-w]).T)[: len(path)]
             moving = path >= ZIGZAG_MIN_STEP_RATIO * size
-            if moving.sum() >= 3 and float(np.median(net[moving] / path[moving])) < ZIGZAG_STRAIGHTNESS:
+            if moving.sum() >= 3 and float(np.median(net[moving] / path[moving])) < cfg.zigzag_straightness:
                 out.setdefault(tid, []).append("zigzag")
 
-    if len(tracks_xy) >= OFFPATH_MIN_TRACKS:
+    if cfg.offpath_on and len(tracks_xy) >= cfg.offpath_min_tracks:
         cell = max(4.0, OFFPATH_CELL_RATIO * size)
         gw, gh = int(math.ceil(width / cell)), int(math.ceil(height / cell))
         visits = np.zeros((gh, gw), np.int32)
@@ -68,7 +100,7 @@ def find_suspects(tracks_xy: dict[int, np.ndarray], width: int, height: int, fps
             np.add.at(visits.reshape(-1), np.unique(flat), 1)  # 1人1マス1回だけ数える
         for tid, flat in cells_of.items():
             others = visits.reshape(-1)[flat] - 1  # 自分を除いた、そのマスを通った人数
-            if np.mean(others == 0) >= OFFPATH_SHARE:
+            if np.mean(others == 0) >= cfg.offpath_share:
                 out.setdefault(tid, []).append("offpath")
     return out
 

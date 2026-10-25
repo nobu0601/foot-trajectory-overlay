@@ -25,7 +25,7 @@ def test_session_counts_and_saves(tmp_path):
     assert s.fps == 10.0
     assert s.add_line(CountLine(150, 0, 150, 199))
     assert not s.add_line(CountLine(10, 10, 11, 11))  # 短すぎる線は無視
-    assert [(c.a_to_b, c.b_to_a) for c in s.counts] == [(1, 1)]
+    assert [(c.in_count, c.out_count) for c in s.counts] == [(1, 1)]
 
     s.line_width = 7
     s.save()

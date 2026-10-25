@@ -56,3 +56,34 @@ def test_time_filter_changes_display_only(tmp_path):
 
     s.add_line(CountLine(150, 0, 150, 199))
     assert s.counts[0].total == 2
+
+
+def test_find_result_dirs_and_all_counts(tmp_path):
+    import csv as _csv
+
+    from foot_overlay.batch import find_result_dirs, write_all_counts
+    from foot_overlay.counting import CountLine
+
+    frame = np.full((200, 300, 3), 100, dtype=np.uint8)
+    tracks = {1: [TrackPoint(i, 20 + i * 10, 100) for i in range(26)]}
+    dirs = []
+    for name in ("a_overlay", "sub/b_overlay"):
+        out = tmp_path / name
+        write_result(out, tmp_path / f"{Path(name).name[:-8]}.mp4", TrackingResult(frame, 10.0, 26, tracks), tracks, 5, 10)
+        dirs.append(out)
+    s = Session(dirs[0])
+    s.set_lines([CountLine(150, 0, 150, 199, "入口")])
+    s.save()
+    found = find_result_dirs(tmp_path)
+    assert found == sorted(dirs, key=lambda p: str(p).lower())
+    n = write_all_counts(tmp_path / "all_counts.csv", found)
+    rows = list(_csv.reader((tmp_path / "all_counts.csv").open(encoding="utf-8-sig")))
+    assert n == 2 and rows[1][2] == "入口" and rows[1][5] == "1"
+    assert rows[2][2] == "（カウント線なし）"
+
+
+def test_scale_lines_keeps_name_and_direction():
+    from foot_overlay.counting import CountLine, scale_lines
+
+    out = scale_lines([CountLine(10, 20, 10, 80, "入口")], 100, 100, 200, 50)
+    assert (out[0].x1, out[0].y1, out[0].y2, out[0].name) == (20, 10, 40, "入口")

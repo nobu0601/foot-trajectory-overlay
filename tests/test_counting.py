@@ -31,9 +31,9 @@ def test_segments_intersect():
 
 def test_direction_is_counted():
     counts, crossings = count_lines({1: walk(200, 0, 100), 2: walk(0, 200, 120)}, [VERTICAL])
-    assert (counts[0].a_to_b, counts[0].b_to_a, counts[0].total) == (1, 1, 2)
+    assert (counts[0].in_count, counts[0].out_count, counts[0].total) == (1, 1, 2)
     by_track = {c.track_id: c.direction for c in crossings}
-    assert by_track == {1: "A->B", 2: "B->A"}
+    assert by_track == {1: "IN", 2: "OUT"}
     assert all(abs(c.x - 100) < 1e-6 for c in crossings)
 
 
@@ -53,7 +53,7 @@ def test_jitter_on_the_line_is_not_double_counted():
 def test_walk_in_and_back_out_counts_both_directions():
     pts = [(150 - 10 * i, 100) for i in range(10)] + [(60 + 10 * i, 100) for i in range(10)]
     counts, _ = count_lines({1: track(pts)}, [VERTICAL], smooth_window=1)
-    assert (counts[0].a_to_b, counts[0].b_to_a) == (1, 1)
+    assert (counts[0].in_count, counts[0].out_count) == (1, 1)
 
 
 def test_multiple_lines_are_counted_separately():

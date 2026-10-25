@@ -24,7 +24,8 @@ def _fmt_sec(sec: float) -> str:
 
 
 class BatchDialog(tk.Toplevel):
-    def __init__(self, master, models: dict[str, str], default_model: str, line_width: int, open_folder, open_result):
+    def __init__(self, master, models: dict[str, str], default_model: str, line_width: int, open_folder, open_result,
+                 start_queue=None):
         super().__init__(master)
         self.title("一括処理 - 重畳画像をまとめて作成")
         self.geometry("820x600")
@@ -33,6 +34,7 @@ class BatchDialog(tk.Toplevel):
         self.models = models
         self.open_folder = open_folder
         self.open_result = open_result  # 結果フォルダをメイン画面で開く関数
+        self.start_queue = start_queue  # 出力フォルダの結果を順にカウント線設定する関数
 
         self.inputs: list[Path] = []
         self.excluded: set[Path] = set()
@@ -111,6 +113,8 @@ class BatchDialog(tk.Toplevel):
         self.btn_stop.pack(side=tk.LEFT, padx=4)
         self.btn_open_out = ttk.Button(run, text="出力フォルダを開く", command=self.open_out)
         self.btn_open_out.pack(side=tk.RIGHT)
+        self.btn_to_queue = ttk.Button(run, text="続けてカウント線を順に設定する ▶", command=self.go_queue)
+        self.btn_to_queue.pack(side=tk.RIGHT, padx=6)
 
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, padx=10, pady=(0, 10))
@@ -179,6 +183,18 @@ class BatchDialog(tk.Toplevel):
             self.open_folder(out)
         else:
             messagebox.showinfo("一括処理", "出力フォルダはまだありません。", parent=self)
+
+    def go_queue(self) -> None:
+        """一括処理の結果を、メイン画面の連続設定で1本ずつ開く。"""
+        out = self._out_dir()
+        if self.running or out is None or self.start_queue is None:
+            return
+        if not (out / "results").is_dir():
+            messagebox.showinfo("一括処理", "まだ解析結果がありません。先に「一括処理を開始」してください。", parent=self)
+            return
+        self.grab_release()
+        self.destroy()
+        self.start_queue(out / "results")
 
     def on_double_click(self, _event=None) -> None:
         """処理済みの動画をダブルクリックすると、メイン画面で結果を開く（カウント線を引ける）。"""
@@ -281,7 +297,7 @@ class BatchDialog(tk.Toplevel):
                     messagebox.showinfo(
                         "一括処理",
                         f"{text}\n\n重畳画像は出力フォルダに「動画名.png」で保存しました。\n"
-                        "一覧の行をダブルクリックすると、その動画の結果を開いてカウント線を引けます。",
+                        "「続けてカウント線を順に設定する」で、1本ずつ線を引いていけます。",
                         parent=self,
                     )
                 elif kind == "error":
@@ -311,7 +327,8 @@ class BatchDialog(tk.Toplevel):
     def _set_running(self, running: bool) -> None:
         self.running = running
         state = tk.DISABLED if running else tk.NORMAL
-        for w in (self.btn_add_folder, self.btn_add_files, self.btn_remove, self.btn_clear, self.btn_out, self.btn_start):
+        for w in (self.btn_add_folder, self.btn_add_files, self.btn_remove, self.btn_clear, self.btn_out, self.btn_start,
+                  self.btn_to_queue):
             w.config(state=state)
         self.model_box.config(state=tk.DISABLED if running else "readonly")
         self.btn_stop.config(state=tk.NORMAL if running else tk.DISABLED)
