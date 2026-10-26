@@ -10,6 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .batch import BatchItem, BatchResult, collect_items, run_batch
+from .resume import progress_info
 
 VIDEO_TYPES = [("動画ファイル", "*.mp4 *.MP4 *.mov *.MOV *.avi *.AVI *.mkv *.MKV"), ("すべてのファイル", "*.*")]
 
@@ -162,10 +163,18 @@ class BatchDialog(tk.Toplevel):
         self.items = [i for i in collect_items(self.inputs) if i.video not in self.excluded and not _inside(i.video, out)]
         self.table.delete(*self.table.get_children())
         for k, item in enumerate(self.items):
-            status = self.status.get(item.video, "")
+            status = self.status.get(item.video) or self._partial_text(out, item)
             people = self.people.get(item.video, "")
             self.table.insert("", tk.END, iid=str(k), values=(item.name, status, people, str(item.video)))
         self.count_var.set(f"{len(self.items)}本")
+
+    @staticmethod
+    def _partial_text(out: Path | None, item: BatchItem) -> str:
+        """前回途中で止まった動画には「途中 xx%」と出す（開始すると続きから再開する）。"""
+        if out is None:
+            return ""
+        info = progress_info(out / "results" / f"{item.name}_overlay", item.video)
+        return f"途中 {info['percent']:.0f}%（続きから）" if info else ""
 
     def choose_out(self) -> None:
         folder = filedialog.askdirectory(parent=self, title="重畳画像の出力フォルダを選択")
@@ -292,6 +301,8 @@ class BatchDialog(tk.Toplevel):
                     failed = sum(r.status == "失敗" for r in results)
                     stopped = sum(r.status == "中止" for r in results)
                     text = f"完了 {ok}本・スキップ {skipped}本・失敗 {failed}本" + (f"・中止 {stopped}本" if stopped else "")
+                    if stopped:
+                        text += "\n途中まで保存しました。同じ出力フォルダでもう一度開始すると、続きから再開します。"
                     self.status_var.set(f"{text}（{_fmt_sec(elapsed)}）。一覧は batch_summary.csv にあります。")
                     self.progress["value"] = 100
                     messagebox.showinfo(
@@ -322,7 +333,7 @@ class BatchDialog(tk.Toplevel):
     def stop(self) -> None:
         if self.stop_event is not None:
             self.stop_event.set()
-            self.status_var.set("中止しています…（いま解析中の動画を止めます）")
+            self.status_var.set("中止しています…（途中まで保存します。もう一度開始すると続きから再開します）")
 
     def _set_running(self, running: bool) -> None:
         self.running = running

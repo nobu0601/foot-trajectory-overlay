@@ -34,6 +34,7 @@ from .drawing import filter_short_tracks
 from .export import save_image
 from .session import Session, SuggestionCancelled, line_color, write_result
 from .suspects import SuspectSettings, reason_text
+from .resume import progress_info
 from .tracking import TrackingCancelled, open_video, track_video
 
 APP_TITLE = "足元軌跡カウントツール"
@@ -139,6 +140,7 @@ class App(tk.Tk):
         self.save_job: str | None = None
         self.suspect_job: str | None = None
         self.stop_event: threading.Event | None = None
+        self.worker: threading.Thread | None = None
         self.busy = False
         self.selected_area: int | None = None
         self.selected_line: int | None = None
@@ -630,6 +632,18 @@ class App(tk.Tk):
 
     def open_video(self, video: Path) -> None:
         out_dir = result_dir_for(video)
+        partial = progress_info(out_dir, video)
+        if partial is not None:
+            done = partial["frames_done"]
+            answer = messagebox.askyesnocancel(
+                APP_TITLE,
+                f"この動画の解析は前回、途中（{partial['percent']:.0f}%・{done:,}フレーム目）で止まっています。\n\n"
+                "「はい」: 続きから再開する\n「いいえ」: 最初から解析し直す",
+            )
+            if answer is None:
+                return
+            self.start_analysis(video, out_dir, resume=answer)
+            return
         if (out_dir / "tracks.csv").is_file():
             answer = messagebox.askyesnocancel(
                 APP_TITLE,
@@ -643,7 +657,7 @@ class App(tk.Tk):
                 return
         self.start_analysis(video, out_dir)
 
-    def start_analysis(self, video: Path, out_dir: Path) -> None:
+    def start_analysis(self, video: Path, out_dir: Path, resume: bool = False) -> None:
         self.flush_save()
         self.session = None
         self.reset_selection()
@@ -654,19 +668,33 @@ class App(tk.Tk):
         self.file_var.set(f"解析中: {video.name}")
         self._set_busy(True)
         self.progress["value"] = 0
-        self.status_var.set(f"{video.name}: 検出モデルを準備しています…")
+        self.status_var.set(
+            f"{video.name}: " + ("前回の続きから再開しています…" if resume else "検出モデルを準備しています…")
+        )
 
         model = MODELS[self.model_var.get()]
         self.stop_event = threading.Event()
         stop = self.stop_event
         started = time.time()
 
+        first_done: list[int] = []  # 再開したときの開始位置（残り時間を正しく見積もるため）
+
         def progress(done: int, total: int, ids: int) -> None:
-            self.messages.put(("progress", video.name, done, total, ids, started))
+            if not first_done:
+                first_done.append(max(0, done - 1))
+            self.messages.put(("progress", video.name, done, total, ids, started, first_done[0]))
 
         def worker() -> None:
             try:
-                result = track_video(video, model_name=model, progress=progress, stop_event=stop)
+                # 途中経過を結果フォルダに保存しておき、止まっても続きから再開できるようにする
+                result = track_video(
+                    video,
+                    model_name=model,
+                    progress=progress,
+                    stop_event=stop,
+                    checkpoint_dir=out_dir,
+                    resume=resume,
+                )
                 tracks = filter_short_tracks(result.tracks, MIN_POINTS)
                 write_result(out_dir, video, result, tracks, smooth=SMOOTH, min_points=MIN_POINTS)
                 self.messages.put(("done", out_dir, len(result.tracks), len(tracks), time.time() - started))
@@ -675,7 +703,8 @@ class App(tk.Tk):
             except Exception as e:  # 画面に理由を出す
                 self.messages.put(("error", f"{type(e).__name__}: {e}"))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
         self.after(100, self.poll_messages)
 
     def poll_messages(self) -> None:
@@ -685,11 +714,11 @@ class App(tk.Tk):
                 msg = self.messages.get_nowait()
                 kind = msg[0]
                 if kind == "progress":
-                    _, name, done, total, ids, started = msg
+                    _, name, done, total, ids, started, base = msg
                     percent = done * 100 / total if total else 0
                     self.progress["value"] = percent
                     elapsed = time.time() - started
-                    remain = elapsed / done * (total - done) if done else 0
+                    remain = elapsed / (done - base) * (total - done) if done > base else 0
                     self.status_var.set(
                         f"{name}: 解析中 {percent:.0f}%（{done}/{total}フレーム, 追跡ID {ids}件, 残り約{_fmt_sec(remain)}）"
                     )
@@ -722,7 +751,11 @@ class App(tk.Tk):
                     )
                 elif kind == "cancelled":
                     finished = True
-                    self.status_var.set("中止しました。")
+                    self.status_var.set(
+                        "中止しました。途中まで保存したので、同じ動画をもう一度選ぶと続きから再開できます。"
+                        if self.session is None
+                        else "中止しました。"
+                    )
                     if self.session is None:
                         self.file_var.set("（動画をまだ開いていません）")
                 elif kind == "error":
@@ -1726,6 +1759,11 @@ class App(tk.Tk):
             if not messagebox.askyesno(APP_TITLE, "処理中です。中止して終了しますか？"):
                 return
             self.stop_event.set()
+            # 解析中なら、途中経過を保存し終えるまで少し待つ（次回続きから再開できるように）
+            if self.worker is not None and self.worker.is_alive():
+                self.status_var.set("途中経過を保存しています…")
+                self.update_idletasks()
+                self.worker.join(timeout=15)
         self.flush_save()
         if self.queue:
             self.write_queue_summary()

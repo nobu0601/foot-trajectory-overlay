@@ -54,6 +54,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="アプリで書き出したカウント線の JSON を読み込んで数える（画像の大きさが違えば座標を合わせる）",
     )
     p.add_argument(
+        "--restart",
+        action="store_true",
+        help="前回途中で止まった解析があっても、続きからではなく最初から解析し直す",
+    )
+    p.add_argument(
         "--suggest",
         nargs="?",
         type=int,
@@ -80,7 +85,11 @@ def process_video(video: Path, args: argparse.Namespace) -> Path:
         tracker=args.tracker,
         device=args.device,
         max_frames=args.max_frames,
+        checkpoint_dir=out_dir,  # 途中で止まっても（Ctrl+C・電源断）、次回は続きから再開する
+        resume=not args.restart,
     )
+    if result.resumed_from:
+        print(f"  前回の続き（{result.resumed_from}フレーム目）から再開しました")
     tracks = filter_short_tracks(result.tracks, args.min_points)
     view = {"line_width": args.line_width, "show_ids": not args.no_ids, "grid": args.grid, "dim": args.dim}
     write_result(out_dir, video, result, tracks, smooth=args.smooth, min_points=args.min_points, view=view)

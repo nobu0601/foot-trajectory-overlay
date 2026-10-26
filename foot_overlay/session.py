@@ -43,6 +43,7 @@ from .export import save_image, save_tracks_csv
 from .suspects import SuspectSettings, find_suspects
 from .textdraw import put_texts, text_size
 from .suggest import DEFAULT_CANDIDATES, Suggestion, save_suggestions_csv, suggest_lines
+from .resume import discard as discard_progress
 from .tracking import TrackingResult, TrackPoint, split_at_frame_edges
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -107,6 +108,7 @@ def write_result(
         "suggestions.png",
     ):
         (out_dir / name).unlink(missing_ok=True)
+    discard_progress(out_dir)  # 最後まで解析できたので、再開用の途中経過はもう要らない
 
 
 def read_image(path: Path) -> np.ndarray:

@@ -6,6 +6,8 @@
   動画名.png             足元軌跡の重畳画像（動画ごと）
   results/動画名_overlay  解析結果（アプリの「解析結果を開く」で開くとカウント線を引ける）
   batch_summary.csv      動画ごとの処理結果の一覧
+
+途中で止めても（中止・終了・電源断）、もう一度同じ出力フォルダで実行すると、止まった動画の続きから再開する。
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .drawing import filter_short_tracks
+from .resume import progress_info
 from .session import Session, write_result
 from .tracking import TrackingCancelled, track_video
 
@@ -104,7 +107,8 @@ def run_batch(
         image_path = out_dir / f"{item.name}.png"
         started = time.time()
         try:
-            if skip_done and (result_dir / "tracks.csv").is_file() and image_path.is_file():
+            partial = progress_info(result_dir, item.video)
+            if skip_done and partial is None and (result_dir / "tracks.csv").is_file() and image_path.is_file():
                 session = Session(result_dir)
                 res = BatchResult(item, "スキップ（解析済み）", people=len(session.tracks))
             else:
@@ -113,8 +117,13 @@ def run_batch(
                     if progress is not None:
                         progress(index, len(items), item, done, total)
 
+                # 途中で止まった動画は、止まった位置から続ける（result_dir に途中経過を保存する）
                 tracked = track_video(
-                    item.video, model_name=model_name, progress=frame_progress, stop_event=stop_event
+                    item.video,
+                    model_name=model_name,
+                    progress=frame_progress,
+                    stop_event=stop_event,
+                    checkpoint_dir=result_dir,
                 )
                 tracks = filter_short_tracks(tracked.tracks, MIN_POINTS)
                 view = {"line_width": line_width} if line_width else None
@@ -128,9 +137,10 @@ def run_batch(
                     people=len(session.tracks),
                     frames=tracked.total_frames,
                     seconds=time.time() - started,
+                    message=_resumed_text(tracked),
                 )
         except TrackingCancelled:
-            res = BatchResult(item, "中止", seconds=time.time() - started)
+            res = BatchResult(item, "中止", seconds=time.time() - started, message=_paused_text(result_dir, item))
         except Exception as e:  # 壊れた動画などがあっても残りは処理する
             res = BatchResult(item, "失敗", seconds=time.time() - started, message=f"{type(e).__name__}: {e}")
         results.append(res)
@@ -138,6 +148,17 @@ def run_batch(
             on_result(res)
         write_summary(out_dir / "batch_summary.csv", results)
     return results
+
+
+def _resumed_text(tracked) -> str:
+    if not tracked.resumed_from:
+        return ""
+    return f"途中（{tracked.resumed_from}フレーム目）から再開"
+
+
+def _paused_text(result_dir: Path, item: BatchItem) -> str:
+    info = progress_info(result_dir, item.video)
+    return f"{info['percent']:.0f}%まで保存済み。次回は続きから" if info else ""
 
 
 def write_summary(path: Path, results: list[BatchResult]) -> None:
