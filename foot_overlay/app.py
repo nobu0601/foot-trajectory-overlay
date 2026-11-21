@@ -32,6 +32,7 @@ from .areas import AREA_KINDS
 from .counting import CountLine
 from .drawing import filter_short_tracks
 from .export import save_image
+from .stitch import KEEP_MIN_POINTS, StitchSettings
 from .session import Session, SuggestionCancelled, line_color, write_result
 from .suspects import SuspectSettings, reason_text
 from .resume import progress_info
@@ -42,6 +43,12 @@ VIDEO_TYPES = [("動画ファイル", "*.mp4 *.MP4 *.mov *.MOV *.avi *.AVI *.mkv
 MODELS = {
     "標準（速い）": "yolo11n.pt",
     "高精度（約3倍遅い）": "yolo11s.pt",
+}
+# 検出の細かさ（YOLO に渡す画像の大きさ）。大きいほど小さく映った人・重なった人を見逃しにくいが遅い
+DETAILS = {
+    "標準": 640,
+    "細かく（混雑・遠く向け、約2倍遅い）": 960,
+    "とても細かく（約4倍遅い）": 1280,
 }
 MIN_POINTS = 10  # この回数未満しか検出されなかったIDはノイズとして除く
 SMOOTH = 5
@@ -63,19 +70,23 @@ STEPS = [
     ("review", "②確認", "② 追跡線を確認する",
      "見やすさを調整し、誤判定らしい線（灰色の点線）を確認します。判定の基準もここで変えられます。"),
     ("suggest", "③候補", "③ カウント線の候補を探す（任意）",
-     "人がよく通る場所（エリア）を決めると、数えやすい線の候補を自動で探します。使わずに④へ進んでも構いません。"),
+     "出入口と人の流れ（またはエリア）から、数えやすい線の候補を自動で探します。使わずに④へ進んでも構いません。"),
     ("lines", "④線", "④ カウント線を決める",
      "画像を2回クリックして線を引きます。線の端の丸はドラッグで動かせます。名前と IN の向きもここで決めます。"),
     ("export", "⑤出力", "⑤ 結果を書き出す",
      "カウント線を JSON で保存・読み込みしたり、画像を保存したりします。人数などは自動で保存されています。"),
 ]
 STEP_KEYS = [s[0] for s in STEPS]
+LEGEND_SUGGEST = {
+    "flow": "橙の丸 = 出入口　色付きの太線と矢印 = 人流の通り道と向き　緑の点線 = 候補線（白 = 選んだ候補）",
+    "area": "水色の枠 = エリア（角の丸をドラッグで形を直す）　緑の点線 = 候補線（白 = 選んだ候補）",
+}
 
 # 画像の下に出す「いま見えている印の意味」
 LEGENDS = {
     "analyze": "色付きの線 = 1人分の足元の通り道　● = 歩き始め　➜ = 歩き終わりと向き",
     "review": "色付きの線 = 足元の通り道　灰色の点線 = 誤判定らしい線　白く太い線 = 一覧で選んだ線",
-    "suggest": "水色の枠 = エリア（角の丸をドラッグで形を直す）　緑の点線 = 候補線（白 = 選んだ候補）",
+    "suggest": "橙の丸 = 出入口　色付きの太線と矢印 = 人流の通り道と向き　緑の点線 = 候補線（白 = 選んだ候補）",
     "lines": "太い線 = カウント線（端の丸をドラッグで調整）　矢印 = IN の向き　赤い点 = 選んだ線で数えた位置"
              "　橙の× = 追跡が途切れた所　紫の○ = 線の端の外をすり抜けた所",
     "export": "カウント線と、数えた位置（赤い点）。保存される結果画像と同じ内容です",
@@ -139,6 +150,7 @@ class App(tk.Tk):
         self.redraw_job: str | None = None
         self.save_job: str | None = None
         self.suspect_job: str | None = None
+        self.stitch_job: str | None = None
         self.stop_event: threading.Event | None = None
         self.worker: threading.Thread | None = None
         self.busy = False
@@ -146,6 +158,7 @@ class App(tk.Tk):
         self.selected_line: int | None = None
         self.selected_suspect: int | None = None
         self.selected_suggestion: int | None = None
+        self.selected_flow: int | None = None
         self.area_draft: list[tuple[float, float]] | None = None  # 手で追加中のエリアの頂点
         self.vertex_drag: tuple[int, int] | None = None  # ドラッグ中の (エリア番号, 頂点番号)
         self.line_drag: tuple[int, int] | None = None  # ドラッグ中の (線番号, 0=始点/1=終点)
@@ -314,9 +327,16 @@ class App(tk.Tk):
         self.model_var = tk.StringVar(value=next(iter(MODELS)))
         self.model_box = ttk.Combobox(row, textvariable=self.model_var, values=list(MODELS), state="readonly", width=20)
         self.model_box.pack(side=tk.LEFT, padx=6)
+        row2 = ttk.Frame(box)
+        row2.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(row2, text="検出の細かさ:").pack(side=tk.LEFT)
+        self.detail_var = tk.StringVar(value=next(iter(DETAILS)))
+        self.detail_box = ttk.Combobox(row2, textvariable=self.detail_var, values=list(DETAILS), state="readonly", width=30)
+        self.detail_box.pack(side=tk.LEFT, padx=6)
         self.btn_video = ttk.Button(box, text="動画を選んで解析を始める…", style="Primary.TButton", command=self.choose_video)
         self.btn_video.pack(fill=tk.X)
-        ttk.Label(box, text="解析は全フレームで行います。長い動画は時間がかかります（進み具合は画面の下に出ます）。",
+        ttk.Label(box, text="解析は全フレームで行います。長い動画は時間がかかります（進み具合は画面の下に出ます）。\n"
+                            "人が混み合う・遠くの人が小さく映る動画は「細かく」にすると見逃しが減ります。",
                   style="Guide.TLabel", wraplength=350, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
 
         box2 = self._section(f, "解析済みの結果・たくさんの動画")
@@ -365,6 +385,24 @@ class App(tk.Tk):
         ttk.Checkbutton(crow, text="ID番号", variable=self.ids_var, command=self.on_view_toggle).pack(side=tk.LEFT, padx=(12, 0))
         self.grid_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(crow, text="座標の格子", variable=self.grid_var, command=self.on_view_toggle).pack(side=tk.LEFT, padx=(8, 0))
+
+        boxs = self._section(f, "途切れた追跡線をつなぐ")
+        ttk.Label(boxs, text="人が重なったり物陰に隠れたりして途切れた線を、途切れた位置・歩く向きと速さから"
+                             "同じ人と分かるものだけ1本にまとめます（同じ人を2人と数えるのを防ぎます）。",
+                  style="Guide.TLabel", wraplength=350, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 6))
+        srow = ttk.Frame(boxs)
+        srow.pack(fill=tk.X)
+        self.stitch_on_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(srow, text="つなぐ", variable=self.stitch_on_var, command=self.schedule_stitch_update).pack(side=tk.LEFT)
+        ttk.Label(srow, text="　見えなかった時間が").pack(side=tk.LEFT)
+        self.stitch_gap_var = tk.DoubleVar(value=2.0)
+        gap_box = ttk.Spinbox(srow, from_=0.2, to=10, increment=0.5, textvariable=self.stitch_gap_var, width=5,
+                              command=self.schedule_stitch_update)
+        gap_box.bind("<KeyRelease>", lambda e: self.schedule_stitch_update())
+        gap_box.pack(side=tk.LEFT, padx=3)
+        ttk.Label(srow, text="秒以内").pack(side=tk.LEFT)
+        self.stitch_info_var = tk.StringVar()
+        ttk.Label(boxs, textvariable=self.stitch_info_var).pack(anchor=tk.W, pady=(4, 0))
 
         box2 = self._section(f, "誤判定らしい追跡線")
         ttk.Label(box2, text="灰色の点線で表示します。人数からは外しませんが、③の候補線はこれらが通らない位置に引きます。",
@@ -433,7 +471,46 @@ class App(tk.Tk):
     # ---------- ③ 候補 ----------
 
     def _build_suggest(self, f) -> None:
-        box = self._section(f, "1. エリアを決める")
+        box0 = self._section(f, "探し方")
+        self.mode_var = tk.StringVar(value="flow")
+        ttk.Radiobutton(box0, text="出入口と人流から（おすすめ）", value="flow", variable=self.mode_var,
+                        command=self.on_mode_change).pack(anchor=tk.W)
+        ttk.Label(box0, text="人が現れた所・消えた所から出入口を見つけ、出入口の組ごとに人の流れ（人流）を分けます。"
+                             "人流と決まった角度以上で交わる線を候補にします。",
+                  style="Guide.TLabel", wraplength=330, justify=tk.LEFT).pack(anchor=tk.W, padx=(22, 0), pady=(0, 4))
+        ttk.Radiobutton(box0, text="エリアごと（前の方式）", value="area", variable=self.mode_var,
+                        command=self.on_mode_change).pack(anchor=tk.W)
+        ttk.Label(box0, text="人がよく通る場所（エリア）を決め、エリアの流れに直角な線を候補にします。",
+                  style="Guide.TLabel", wraplength=330, justify=tk.LEFT).pack(anchor=tk.W, padx=(22, 0))
+
+        # --- 出入口と人流 ---
+        self.flow_box = box = self._section(f, "1. 出入口と人流を見つける")
+        ttk.Label(box, text="橙の丸 = 出入口（G1, G2 …）、色付きの太線 = 人流の代表的な通り道（F1, F2 …）。",
+                  style="Guide.TLabel", wraplength=350, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 6))
+        self.btn_flows = ttk.Button(box, text="出入口と人流を見つける", command=self.detect_flows)
+        self.btn_flows.pack(fill=tk.X, pady=(0, 6))
+        cols = ("flow", "gates", "people")
+        self.flow_table = ttk.Treeview(box, columns=cols, show="headings", height=4, selectmode="browse")
+        for col, text, width in zip(cols, ("人流", "出入口", "人数（行き/帰り）"), (60, 120, 170)):
+            self.flow_table.heading(col, text=text)
+            self.flow_table.column(col, width=width, anchor=tk.CENTER)
+        self.flow_table.pack(fill=tk.X)
+        self.flow_table.bind("<<TreeviewSelect>>", self.on_flow_select)
+        arow = ttk.Frame(box)
+        arow.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(arow, text="人流と交わる角度:").pack(side=tk.LEFT)
+        self.angle_var = tk.IntVar(value=60)
+        angle_box = ttk.Spinbox(arow, from_=30, to=90, increment=5, textvariable=self.angle_var, width=5,
+                                command=self.on_angle_change)
+        angle_box.bind("<KeyRelease>", lambda e: self.on_angle_change())
+        angle_box.pack(side=tk.LEFT, padx=4)
+        ttk.Label(arow, text="度以上").pack(side=tk.LEFT)
+        self.flow_info_var = tk.StringVar()
+        ttk.Label(box, textvariable=self.flow_info_var, style="Guide.TLabel", wraplength=350,
+                  justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+
+        # --- エリア ---
+        self.area_box = box = self._section(f, "1. エリアを決める")
         ttk.Label(box, text="「自動で見つける」を押すか、「手で囲む」→ 画像の上で角を順にクリック → Enter。"
                             "形は角の丸をドラッグで直せます。",
                   style="Guide.TLabel", wraplength=350, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 6))
@@ -460,14 +537,14 @@ class App(tk.Tk):
         self.kind_box.pack(side=tk.LEFT, padx=4)
         self.kind_box.bind("<<ComboboxSelected>>", self.on_kind_change)
 
-        box2 = self._section(f, "2. 候補を探す")
-        nrow = ttk.Frame(box2)
+        self.suggest_box = box2 = self._section(f, "2. 候補を探す")
+        self.n_row = nrow = ttk.Frame(box2)
         nrow.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(nrow, text="評価する候補線（各エリア・最大）:").pack(side=tk.LEFT)
         self.n_var = tk.IntVar(value=20000)
         ttk.Spinbox(nrow, from_=1000, to=100000, increment=1000, textvariable=self.n_var, width=8).pack(side=tk.LEFT, padx=4)
         ttk.Label(nrow, text="本").pack(side=tk.LEFT)
-        self.btn_suggest = ttk.Button(box2, text="候補を探す（各エリア上位3本）", style="Primary.TButton", command=self.start_suggest)
+        self.btn_suggest = ttk.Button(box2, text="候補を探す（各人流上位3本）", style="Primary.TButton", command=self.start_suggest)
         self.btn_suggest.pack(fill=tk.X)
         cols = ("cand", "people", "rate", "dup", "rel")
         self.suggest_table = ttk.Treeview(box2, columns=cols, show="headings", height=5, selectmode="browse")
@@ -479,8 +556,33 @@ class App(tk.Tk):
         self.suggest_table.bind("<Double-Button-1>", lambda e: self.adopt_suggestion())
         self.btn_adopt = ttk.Button(box2, text="選んだ候補をカウント線にする", command=self.adopt_suggestion)
         self.btn_adopt.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(box2, text="順位 = 数えた人 × 信頼度。誤判定らしい線が通る位置は使いません。\n割合 = エリアを通った人のうち数えた割合。",
+        self.suggest_guide_var = tk.StringVar()
+        ttk.Label(box2, textvariable=self.suggest_guide_var,
                   style="Guide.TLabel", wraplength=350, justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
+        self.show_mode_widgets("flow")
+
+    def show_mode_widgets(self, mode: str) -> None:
+        """探し方に合わせて、③の部品を出し分ける。"""
+        if mode == "flow":
+            self.area_box.pack_forget()
+            self.flow_box.pack(fill=tk.X, pady=(0, 10), before=self.suggest_box)
+            self.n_row.pack_forget()
+            self.btn_suggest.config(text="候補を探す（各人流の上位3本）")
+            self.suggest_guide_var.set(
+                "順位 = 数えた人 × 信頼度。誤判定らしい線が通る位置は使いません。\n"
+                "数えた人・割合 = その人流の人のうち、この線で数えられる人数と割合。"
+            )
+        else:
+            self.flow_box.pack_forget()
+            self.area_box.pack(fill=tk.X, pady=(0, 10), before=self.suggest_box)
+            self.n_row.pack(fill=tk.X, pady=(0, 6), before=self.btn_suggest)
+            self.btn_suggest.config(text="候補を探す（各エリアの上位3本）")
+            self.suggest_guide_var.set(
+                "順位 = 数えた人 × 信頼度。誤判定らしい線が通る位置は使いません。\n割合 = エリアを通った人のうち数えた割合。"
+            )
+        LEGENDS["suggest"] = LEGEND_SUGGEST[mode]
+        if self.step == "suggest":
+            self.legend_var.set(LEGENDS["suggest"])
 
     # ---------- ④ カウント線 ----------
 
@@ -581,8 +683,11 @@ class App(tk.Tk):
         self.canvas.config(cursor="crosshair" if key in ("suggest", "lines") else "arrow")
         self.render_dirty = True
         self.schedule_redraw()
-        if key == "suggest" and self.session is not None and not self.session.areas:
-            self.status_var.set("「自動で見つける」でエリアを作るか、「手で囲む」でエリアを囲んでください。")
+        if key == "suggest" and self.session is not None:
+            if self.session.suggest_mode == "flow" and not self.session.flows:
+                self.status_var.set("「出入口と人流を見つける」を押すか、そのまま「候補を探す」を押してください。")
+            elif self.session.suggest_mode == "area" and not self.session.areas:
+                self.status_var.set("「自動で見つける」でエリアを作るか、「手で囲む」でエリアを囲んでください。")
         elif key == "lines" and self.session is not None and not self.session.lines:
             self.status_var.set("画像を2回クリック（始点 → 終点）してカウント線を引いてください。")
 
@@ -673,6 +778,7 @@ class App(tk.Tk):
         )
 
         model = MODELS[self.model_var.get()]
+        imgsz = DETAILS.get(self.detail_var.get(), 640)
         self.stop_event = threading.Event()
         stop = self.stop_event
         started = time.time()
@@ -690,12 +796,14 @@ class App(tk.Tk):
                 result = track_video(
                     video,
                     model_name=model,
+                    imgsz=imgsz,
                     progress=progress,
                     stop_event=stop,
                     checkpoint_dir=out_dir,
                     resume=resume,
                 )
-                tracks = filter_short_tracks(result.tracks, MIN_POINTS)
+                # 短い切れ端も残して保存する（開くときに途切れた線をつないでから短い線を除く）
+                tracks = filter_short_tracks(result.tracks, KEEP_MIN_POINTS)
                 write_result(out_dir, video, result, tracks, smooth=SMOOTH, min_points=MIN_POINTS)
                 self.messages.put(("done", out_dir, len(result.tracks), len(tracks), time.time() - started))
             except TrackingCancelled:
@@ -727,14 +835,18 @@ class App(tk.Tk):
                     finished = True
                     self._set_busy(False)
                     self.load_result(out_dir)
-                    self.status_var.set(
-                        f"解析が終わりました（{_fmt_sec(elapsed)}）。追跡線 {n_drawn}本。「次の手順 →」で②へ進んでください。"
-                    )
+                    if self.session is not None:
+                        joined = f"（途切れた線を {self.session.stitched} か所つなぎました）" if self.session.stitched else ""
+                        self.status_var.set(
+                            f"解析が終わりました（{_fmt_sec(elapsed)}）。追跡線 {len(self.session.tracks)}本{joined}。"
+                            "「次の手順 →」で②へ進んでください。"
+                        )
                 elif kind == "suggest_progress":
                     _, area_i, n_areas, done, total = msg
                     overall = (area_i + done / total) / n_areas * 100 if total else 0
                     self.progress["value"] = overall
-                    self.status_var.set(f"候補線を評価中: エリア E{area_i + 1}/{n_areas}（{done:,}/{total:,}本）")
+                    head = "人流 F" if self.session is not None and self.session.suggest_mode == "flow" else "エリア E"
+                    self.status_var.set(f"候補線を評価中: {head}{area_i + 1}/{n_areas}（{done:,}/{total:,}本）")
                 elif kind == "suggest_done":
                     finished = True
                     _, suggestions, elapsed = msg
@@ -797,6 +909,12 @@ class App(tk.Tk):
         self.start_scale.set(0)
         self.end_scale.set(duration)
         self.repeat_var.set(round(session.repeat_sec, 1))
+        self.mode_var.set(session.suggest_mode)
+        self.angle_var.set(round(session.flow_settings.min_angle))
+        self.show_mode_widgets(session.suggest_mode)
+        self.stitch_on_var.set(session.stitch_settings.on)
+        self.stitch_gap_var.set(session.stitch_settings.max_gap_sec)
+        self.update_stitch_info()
         cfg = session.suspect_settings
         for k, var in self.sus_vars.items():
             value = getattr(cfg, k)
@@ -828,7 +946,8 @@ class App(tk.Tk):
 
         self.flush_save()
         width = self.session.line_width if self.session is not None else 1
-        BatchDialog(self, MODELS, self.model_var.get(), width, open_in_file_manager, self.load_result, self.start_queue)
+        BatchDialog(self, MODELS, self.model_var.get(), width, open_in_file_manager, self.load_result, self.start_queue,
+                    details=DETAILS, default_detail=self.detail_var.get())
 
     # ================= 連続設定 =================
 
@@ -1036,6 +1155,43 @@ class App(tk.Tk):
         s.set_suspect_ok(tid, tid not in s.suspect_ok)
         self.suspects_changed()
 
+    def schedule_stitch_update(self) -> None:
+        if self._setting or self.session is None:
+            return
+        if self.stitch_job is not None:
+            self.after_cancel(self.stitch_job)
+        self.stitch_job = self.after(400, self.apply_stitch_settings)
+
+    def apply_stitch_settings(self) -> None:
+        self.stitch_job = None
+        if self.session is None:
+            return
+        try:
+            cfg = StitchSettings(on=bool(self.stitch_on_var.get()), max_gap_sec=float(self.stitch_gap_var.get()))
+        except (tk.TclError, ValueError):
+            return
+        cfg.max_gap_sec = min(max(cfg.max_gap_sec, 0.1), 30.0)
+        self.session.set_stitch_settings(cfg)
+        self.selected_flow = None
+        self.selected_suggestion = None
+        self.update_stitch_info()
+        self.suspects_changed()
+        self.refresh_table()
+        self.refresh_area_tables()
+        self.status_var.set(
+            f"追跡線を作り直しました: {len(self.session.tracks)}本"
+            + (f"（{self.session.stitched}か所つなぎました）" if self.session.stitched else "")
+        )
+
+    def update_stitch_info(self) -> None:
+        s = self.session
+        if s is None:
+            self.stitch_info_var.set("")
+        elif not s.stitch_settings.on:
+            self.stitch_info_var.set("つないでいません。")
+        else:
+            self.stitch_info_var.set(f"{s.stitched}か所つないでいます（追跡線 {len(s.tracks)}本）。")
+
     def schedule_suspect_update(self) -> None:
         """判定基準の入力が止まってから検知し直す（数字を打っている途中で何度も計算しないように）。"""
         if self._setting or self.session is None:
@@ -1110,7 +1266,10 @@ class App(tk.Tk):
         if self.session is None or self.busy:
             return
         if self.step == "suggest":
-            self.on_area_press(event)
+            if self.session.suggest_mode == "flow":
+                self.on_flow_press(event)
+            else:
+                self.on_area_press(event)
         elif self.step == "lines":
             self.on_line_press(event)
 
@@ -1160,7 +1319,12 @@ class App(tk.Tk):
             self.draw_area_draft()
         elif self.session is not None and self.step in ("lines", "suggest"):
             # つかめる丸の上ではカーソルを手の形にする
-            grab = (self.pick_endpoint(event.x, event.y) if self.step == "lines" else self.pick_vertex(event.x, event.y))
+            if self.step == "lines":
+                grab = self.pick_endpoint(event.x, event.y)
+            elif self.session.suggest_mode == "area":
+                grab = self.pick_vertex(event.x, event.y)
+            else:
+                grab = None
             self.canvas.config(cursor="hand2" if grab is not None else "crosshair")
 
     def cancel_or_undo(self) -> None:
@@ -1359,6 +1523,7 @@ class App(tk.Tk):
         self.pending = None
         self.selected_area = None
         self.selected_suggestion = None
+        self.selected_flow = None
         self.selected_line = None
         self.selected_suspect = None
         self.area_draft = None
@@ -1381,10 +1546,19 @@ class App(tk.Tk):
             return
         for i, area in enumerate(s.areas):
             self.area_table.insert("", tk.END, values=(f"E{i + 1}", area.kind_label, f"{s.area_people(i)}人"))
+        self.flow_table.delete(*self.flow_table.get_children())
+        for i, flow in enumerate(s.flows):
+            self.flow_table.insert("", tk.END, values=(f"F{i + 1}", flow.label,
+                                                       f"{flow.people}人（{flow.forward}/{flow.backward}）"))
+        if self.selected_flow is not None and self.selected_flow < len(s.flows):
+            self.flow_table.selection_set(self.flow_table.get_children()[self.selected_flow])
+        else:
+            self.selected_flow = None
+        self.update_flow_info()
         for sg in s.suggestions:
             self.suggest_table.insert(
                 "", tk.END,
-                values=(f"E{sg.area_index + 1}-{sg.rank}", f"{sg.people}人", f"{sg.coverage:.0%}", sg.duplicates,
+                values=(sg.label, f"{sg.people}人", f"{sg.coverage:.0%}", sg.duplicates,
                         f"{sg.reliability:.0f} {sg.grade}" if sg.grade else ""),
             )
         if self.selected_area is not None and self.selected_area < len(s.areas):
@@ -1398,6 +1572,91 @@ class App(tk.Tk):
         self.refresh_table()
         self.refresh_area_tables()
         self.refresh_suspect_table()
+
+    # ---------- ③ 出入口と人流 ----------
+
+    def on_mode_change(self) -> None:
+        mode = self.mode_var.get()
+        self.show_mode_widgets(mode)
+        if self.session is None:
+            return
+        if self.session.suggestions and mode != self.session.suggest_mode:
+            if not messagebox.askyesno(APP_TITLE, "探し方を変えると、今の候補線は消えます。よろしいですか？"):
+                self.mode_var.set(self.session.suggest_mode)
+                self.show_mode_widgets(self.session.suggest_mode)
+                return
+        self.session.set_suggest_mode(mode)
+        self.selected_suggestion = None
+        self.areas_changed()
+        if mode == "flow" and not self.session.flows:
+            self.status_var.set("「出入口と人流を見つける」を押すか、そのまま「候補を探す」を押してください。")
+
+    def detect_flows(self) -> None:
+        if self.session is None:
+            return
+        if self.session.flows and any(sg.flow_index >= 0 for sg in self.session.suggestions):
+            if not messagebox.askyesno(APP_TITLE, "今の人流と候補線を消して、出入口と人流を見つけ直しますか？"):
+                return
+        self.session.detect_flows()
+        self.selected_flow = None
+        self.selected_suggestion = None
+        self.areas_changed()
+        s = self.session
+        if s.flows:
+            self.status_var.set(
+                f"出入口を {len(s.gateways)} か所、人流を {len(s.flows)} 本見つけました。一覧で選ぶとその人流だけを表示します。"
+            )
+        else:
+            self.status_var.set("人流が見つかりませんでした（出入口どうしを歩いた人が少ないため）。")
+
+    def update_flow_info(self) -> None:
+        s = self.session
+        if s is None or not s.gateways:
+            self.flow_info_var.set("")
+            return
+        in_flows = sum(f.people for f in s.flows)
+        self.flow_info_var.set(
+            f"出入口 {len(s.gateways)} か所・人流 {len(s.flows)} 本（{in_flows}人）。"
+            "出入口どうしを歩かなかった人（途中で追跡が切れた人など）は人流に入りません。"
+            "角度は 90 にすると人流に直角な線だけになります。"
+        )
+
+    def on_flow_select(self, _event=None) -> None:
+        sel = self.flow_table.selection()
+        if not sel or self.session is None:
+            return
+        index = self.flow_table.index(sel[0])
+        if index != self.selected_flow:
+            self.selected_flow = index
+            self.render_dirty = True
+            self.schedule_redraw()
+
+    def on_flow_press(self, event) -> None:
+        """画像をクリックすると、その場所を通る人流を選ぶ（人流の外なら選択を外して全部を表示）。"""
+        point = self.to_image(event.x, event.y)
+        if point is None:
+            return
+        hit = next((i for i, f in enumerate(self.session.flows) if f.contains(*point)), None)
+        if hit is None:
+            self.selected_flow = None
+            self.flow_table.selection_remove(*self.flow_table.selection())
+        else:
+            self.selected_flow = hit
+            self.flow_table.selection_set(self.flow_table.get_children()[hit])
+        self.render_dirty = True
+        self.schedule_redraw()
+
+    def on_angle_change(self) -> None:
+        if self._setting or self.session is None:
+            return
+        try:
+            angle = float(self.angle_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self.session.flow_settings.min_angle = min(max(angle, 10.0), 90.0)
+        self.schedule_save()
+        if any(sg.flow_index >= 0 for sg in self.session.suggestions):
+            self.status_var.set("角度を変えました。「候補を探す」を押し直すと反映されます。")
 
     def detect_areas(self) -> None:
         if self.session is None:
@@ -1520,7 +1779,18 @@ class App(tk.Tk):
             return
         if self.area_draft is not None:
             self.finish_area_draft()
-        if not self.session.areas:
+        if self.session.suggest_mode == "flow":
+            if not self.session.flows:
+                self.session.detect_flows()
+                self.areas_changed()
+                if not self.session.flows:
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        "人流が見つかりませんでした（出入口どうしを歩いた人が少ないため）。\n"
+                        "「エリアごと」の探し方を試すか、④で手で線を引いてください。",
+                    )
+                    return
+        elif not self.session.areas:
             self.session.auto_detect_areas()
             self.areas_changed()
             if not self.session.areas:
@@ -1532,7 +1802,7 @@ class App(tk.Tk):
             n = 20000
         n = min(max(n, 100), 200000)
         session = self.session
-        n_areas = len(session.areas)
+        n_areas = len(session.flows) if session.suggest_mode == "flow" else len(session.areas)
         self.stop_event = threading.Event()
         stop = self.stop_event
         started = time.time()
@@ -1575,7 +1845,7 @@ class App(tk.Tk):
             c = self.session.counts[-1]
             name = self.session.lines[-1].label(len(self.session.lines) - 1)
             self.status_var.set(
-                f"候補 E{sg.area_index + 1}-{sg.rank} を {name} にしました: IN {c.in_count}人 / OUT {c.out_count}人。"
+                f"候補 {sg.label} を {name} にしました: IN {c.in_count}人 / OUT {c.out_count}人。"
                 "④で名前と向きを決められます。"
             )
 
@@ -1659,8 +1929,9 @@ class App(tk.Tk):
         s = self.session
         step = self.step
         s.show_areas = step == "suggest"
+        highlight = self.selected_flow if s.suggest_mode == "flow" else self.selected_area
         return s.render(
-            self.selected_area if step == "suggest" else None,
+            highlight if step == "suggest" else None,
             self.selected_suggestion if step == "suggest" else None,
             selected_line=self.selected_line if step == "lines" else None,
             highlight_track=self.selected_suspect if step == "review" else None,
@@ -1738,13 +2009,14 @@ class App(tk.Tk):
         for w in (
             self.btn_video, self.btn_result, self.btn_batch, self.btn_folder, self.btn_folder2,
             self.btn_toggle_suspect, self.btn_sus_reset, self.btn_all_time,
-            self.btn_detect, self.btn_add_area, self.btn_del_area, self.btn_suggest, self.btn_adopt,
+            self.btn_detect, self.btn_add_area, self.btn_del_area, self.btn_suggest, self.btn_adopt, self.btn_flows,
             self.btn_rename, self.btn_reverse, self.btn_delete, self.btn_clear,
             self.btn_export, self.btn_import, self.btn_save_view, self.btn_queue,
             self.btn_q_prev, self.btn_q_next, self.btn_q_end,
         ):
             w.state(state)
         self.model_box.state(["disabled"] if busy else ["!disabled", "readonly"])
+        self.detail_box.state(["disabled"] if busy else ["!disabled", "readonly"])
         self.btn_cancel.state(["!disabled"] if busy else ["disabled"])
         if busy:
             self.btn_cancel.config(text="候補探しを中止" if self.session is not None else "解析を中止")

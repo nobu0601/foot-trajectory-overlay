@@ -25,6 +25,7 @@ from pathlib import Path
 
 from .drawing import filter_short_tracks
 from .resume import progress_info
+from .stitch import KEEP_MIN_POINTS
 from .session import Session, write_result
 from .tracking import TrackingCancelled, track_video
 
@@ -88,6 +89,7 @@ def run_batch(
     items: list[BatchItem],
     out_dir: Path,
     model_name: str = "yolo11n.pt",
+    imgsz: int = 640,
     line_width: int | None = None,
     skip_done: bool = True,
     progress: ItemProgress | None = None,
@@ -121,11 +123,12 @@ def run_batch(
                 tracked = track_video(
                     item.video,
                     model_name=model_name,
+                    imgsz=imgsz,
                     progress=frame_progress,
                     stop_event=stop_event,
                     checkpoint_dir=result_dir,
                 )
-                tracks = filter_short_tracks(tracked.tracks, MIN_POINTS)
+                tracks = filter_short_tracks(tracked.tracks, KEEP_MIN_POINTS)  # 切れ端は開くときにつなぐ
                 view = {"line_width": line_width} if line_width else None
                 write_result(result_dir, item.video, tracked, tracks, smooth=SMOOTH, min_points=MIN_POINTS, view=view)
                 session = Session(result_dir)
@@ -228,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-o", "--out-dir", type=Path, required=True, help="出力フォルダ")
     p.add_argument("--model", default="yolo11n.pt", help="YOLOモデル（既定: yolo11n.pt）")
     p.add_argument("--line-width", type=int, help="追跡線の太さpx（省略時は自動）")
+    p.add_argument("--imgsz", type=int, default=640, help="検出の細かさ（640/960/1280。大きいほど混雑・遠くの人に強いが遅い）")
     p.add_argument("--redo", action="store_true", help="解析済みの動画も解析し直す")
     args = p.parse_args(argv)
 
@@ -248,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         items,
         args.out_dir,
         model_name=args.model,
+        imgsz=args.imgsz,
         line_width=args.line_width,
         skip_done=not args.redo,
         progress=progress,

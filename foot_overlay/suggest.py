@@ -45,6 +45,14 @@ class Suggestion:
     lower: int = 0  # 推定範囲の下限
     upper: int = 0  # 推定範囲の上限
     reasons: list[str] = field(default_factory=list)  # 信頼度が低い理由
+    flow_index: int = -1  # 「出入口と人流から」で探した候補なら人流の番号（エリアの候補なら -1）
+
+    @property
+    def label(self) -> str:
+        """画面に出す候補の名前（E1-2 = エリア1の2位、F1-2 = 人流1の2位）。"""
+        if self.flow_index >= 0:
+            return f"F{self.flow_index + 1}-{self.rank}"
+        return f"E{self.area_index + 1}-{self.rank}"
 
     @property
     def final_score(self) -> float:
@@ -252,8 +260,14 @@ def suggest_lines(
     progress: ProgressCallback | None = None,
     suspects: set[int] | None = None,
     repeat_sec: float = REPEAT_SEC,
+    candidates: np.ndarray | None = None,
+    target_ids: set[int] | None = None,
 ) -> list[Suggestion]:
     """1つのエリアについて、カウント線の候補を最大 top_k 本返す。
+
+    candidates: 候補線 (N, 4) を渡すと、1 の作り方の代わりにそれを評価する（人流の候補など）
+    target_ids: 渡すと、この追跡IDの人（人流の人）を何人数えられるかで順位を付ける。
+                信頼度は、線を通る全員で評価する
 
     1. 人の流れに直角（±20°）で、エリアの縁から縁まで引いた線を最大 n_candidates 本作る
     2. 誤判定らしい追跡線（suspects）が通る線は除く
@@ -266,14 +280,17 @@ def suggest_lines(
     suspects = suspects or set()
     tracks_xy = {tid: smooth(pts, smooth_window) for tid, pts in tracks.items()}
     normal_xy = {tid: xy for tid, xy in tracks_xy.items() if tid not in suspects}
-    candidates = flow_candidates(area, normal_xy, width, height, n_candidates)
+    if candidates is None:
+        candidates = flow_candidates(area, normal_xy, width, height, n_candidates)
     if len(candidates) == 0:
         return []
     poly = area.points()
     pad = 10
     bbox = (poly[:, 0].min() - pad, poly[:, 1].min() - pad, poly[:, 0].max() + pad, poly[:, 1].max() + pad)
     step = max(2.0, 0.004 * max(width, height))
-    segs = _segments_near(normal_xy, bbox, step)
+    # 順位を付けるのに数える人（人流の候補なら、その人流の人だけ）
+    target_xy = normal_xy if target_ids is None else {t: xy for t, xy in normal_xy.items() if t in target_ids}
+    segs = _segments_near(target_xy, bbox, step)
     if segs is None:
         return []
     P, Q, starts = segs
@@ -301,7 +318,7 @@ def suggest_lines(
     pool = _spread(pre_order, all_mids, separation / 8, RESCORE)
     candidates = candidates[pool]
     # 2段目: 実際のカウント処理と同じ方法で数え直す
-    normal_tracks = {t: tracks[t] for t in normal_xy}
+    normal_tracks = {t: tracks[t] for t in target_xy}
     repeat = max(1, round(fps * repeat_sec))
     people, duplicates, passes = exact_scores(candidates, normal_tracks, smooth_window, margin, repeat)
 
@@ -364,7 +381,8 @@ def suggest_lines(
     return results
 
 
-def save_suggestions_csv(path: Path, suggestions: list[Suggestion], areas: list[Area]) -> None:
+def save_suggestions_csv(path: Path, suggestions: list[Suggestion], places: list[str]) -> None:
+    """places: 各候補の場所の名前（エリアの種類、または人流の出入口）。"""
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(
@@ -373,12 +391,11 @@ def save_suggestions_csv(path: Path, suggestions: list[Suggestion], areas: list[
                 "reliability", "grade", "estimate_low", "estimate_high", "score", "area_people", "coverage", "reasons",
             ]
         )
-        for s in suggestions:
-            kind = areas[s.area_index].kind_label if s.area_index < len(areas) else ""
+        for s, kind in zip(suggestions, places):
             ln = s.line
             w.writerow(
                 [
-                    f"E{s.area_index + 1}", kind, s.rank, round(ln.x1), round(ln.y1), round(ln.x2), round(ln.y2),
+                    s.label.rsplit("-", 1)[0], kind, s.rank, round(ln.x1), round(ln.y1), round(ln.x2), round(ln.y2),
                     s.people, s.passes, s.duplicates, f"{s.reliability:.0f}", s.grade, s.lower, s.upper,
                     f"{s.final_score:.1f}", s.area_people, f"{s.coverage:.3f}", "・".join(s.reasons),
                 ]

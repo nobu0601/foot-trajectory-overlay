@@ -44,6 +44,16 @@ from .suspects import SuspectSettings, find_suspects
 from .textdraw import put_texts, text_size
 from .suggest import DEFAULT_CANDIDATES, Suggestion, save_suggestions_csv, suggest_lines
 from .resume import discard as discard_progress
+from .stitch import StitchSettings, stitch_tracks
+from .flows import (
+    FlowSettings,
+    find_flows,
+    flow_candidates,
+    load_flows,
+    region_polygon,
+    save_flows,
+    walk_mask,
+)
 from .tracking import TrackingResult, TrackPoint, split_at_frame_edges
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -64,6 +74,12 @@ AREA_COLOR = (255, 200, 80)  # 水色系（BGR）
 AREA_HIGHLIGHT = (80, 255, 255)
 SUGGEST_COLOR = (60, 255, 60)  # 緑
 SUGGEST_SELECTED = (255, 255, 255)
+GATE_COLOR = (0, 165, 255)  # 橙（出入口）
+FLOW_COLORS_BGR = [(255, 160, 60), (80, 220, 255), (255, 90, 200), (120, 255, 120), (90, 140, 255), (230, 230, 80)]
+
+
+def flow_color(i: int) -> tuple[int, int, int]:
+    return FLOW_COLORS_BGR[i % len(FLOW_COLORS_BGR)]
 
 
 def line_color(i: int) -> tuple[int, int, int]:
@@ -103,6 +119,7 @@ def write_result(
         "crossings.csv",
         "count_result.png",
         "areas.json",
+        "flows.json",
         "suggestions.json",
         "suggestions.csv",
         "suggestions.png",
@@ -135,8 +152,13 @@ class Session:
         h, w = self.first_frame.shape[:2]
         self.width, self.height = w, h
         # 足元が画面外に出た点は使わない（古い解析結果にも効くよう、読み込み時に処理する）
-        min_points = int(self.meta.get("min_points", 10))
-        self.tracks = filter_short_tracks(split_at_frame_edges(load_tracks_csv(tracks_path), w, h), min_points)
+        self.min_points = int(self.meta.get("min_points", 10))
+        self._raw_tracks = split_at_frame_edges(load_tracks_csv(tracks_path), w, h)
+        # 途切れた追跡線をつなぐ（stitch.py）。つないでから短い線を除く（短い切れ端もつなげるように）
+        self.stitch_settings = StitchSettings.from_dict(self.meta.get("stitch"))
+        self.stitched = 0  # つないだ箇所の数
+        self.tracks: dict[int, list[TrackPoint]] = {}
+        self._apply_stitch()
         self.scale = max(w, h) / 1280
         # 足元の位置の細かな揺れで二重に数えないよう、線からこの距離以上離れて初めて「渡った」とみなす
         self.margin = max(3.0, 0.01 * max(w, h))
@@ -164,6 +186,11 @@ class Session:
         self.recount()
 
         self.areas: list[Area] = load_areas(result_dir / "areas.json")
+        # 候補線の探し方: "flow" = 出入口と人流から（標準）、"area" = エリアごと
+        # （この機能より前にエリアで候補を探した結果は、エリアのまま開く）
+        self.suggest_mode: str = self.meta.get("suggest_mode") or ("area" if self.areas else "flow")
+        self.flow_settings = FlowSettings.from_dict(self.meta.get("flow_settings"))
+        self.gateways, self.flows = load_flows(result_dir / "flows.json")
         self.suggestions: list[Suggestion] = load_suggestions(result_dir / "suggestions.json")
         self.show_areas = True
         if self.areas and self.lines:
@@ -204,6 +231,10 @@ class Session:
         """カウント線の信頼度・推定範囲（evaluate.py）。"""
         mid = (line.p1 + line.p2) / 2
         area = next((a for a in getattr(self, "areas", []) if a.contains(*mid)), None)
+        polygon = area.points() if area is not None else None
+        if polygon is None:
+            flow = next((f for f in getattr(self, "flows", []) if f.contains(*mid)), None)
+            polygon = flow.corridor_points() if flow is not None else None
         return evaluate_line(
             line,
             self.tracks,
@@ -213,7 +244,7 @@ class Session:
             self.fps,
             self.margin,
             suspects=self.suspects,
-            area_polygon=area.points() if area is not None else None,
+            area_polygon=polygon,
             repeat_sec=self.repeat_sec,
         )
 
@@ -238,6 +269,25 @@ class Session:
         self.suspect_settings = settings
         self._suspects_found = None
         self._overlay_cache.clear()
+        self.recount()
+
+    def _apply_stitch(self) -> None:
+        tracks, self.stitched = stitch_tracks(
+            self._raw_tracks, self.width, self.height, self.fps, self.stitch_settings
+        )
+        self.tracks = filter_short_tracks(tracks, self.min_points)
+
+    def set_stitch_settings(self, settings: StitchSettings) -> None:
+        """途切れた追跡線のつなぎ方を変えて、追跡線を作り直す。"""
+        self.stitch_settings = settings
+        self._apply_stitch()
+        self._tracks_xy = None
+        self._suspects_found = None
+        self._overlay_cache.clear()
+        # 追跡線の番号が変わるので、前に見つけた人流（人の番号の一覧）は使えない。見つけ直してもらう
+        if self.flows:
+            self.gateways, self.flows = [], []
+            self.suggestions = [sg for sg in self.suggestions if sg.flow_index < 0]
         self.recount()
 
     def set_repeat_sec(self, seconds: float) -> None:
@@ -356,6 +406,31 @@ class Session:
         self.suggestions = [sg for sg in self.suggestions if sg.area_index != index]
         self.recount()
 
+    # ---- 出入口と人流 ----
+
+    def cut_ends(self) -> tuple[set[int], set[int]]:
+        """動画の始まり・終わりで切れている追跡線（その端は出入口ではない）。"""
+        last = max((pts[-1].frame for pts in self.tracks.values() if pts), default=0)
+        last = max(last, int(self.meta.get("frames") or 0) - 1)
+        near = max(1, round(0.5 * self.fps))
+        cut_start = {t for t, pts in self.tracks.items() if pts and pts[0].frame <= near}
+        cut_end = {t for t, pts in self.tracks.items() if pts and pts[-1].frame >= last - near}
+        return cut_start, cut_end
+
+    def detect_flows(self) -> None:
+        """出入口と人流を見つけ直す（人流の候補線は消す）。"""
+        cut_start, cut_end = self.cut_ends()
+        self.gateways, self.flows = find_flows(
+            self.tracks_xy, self.width, self.height, self.suspects, cut_start, cut_end
+        )
+        self.suggestions = [sg for sg in self.suggestions if sg.flow_index < 0]
+        self.recount()  # すり抜けの評価は人流の範囲の縁まで見るので、評価し直す
+
+    def set_suggest_mode(self, mode: str) -> None:
+        if mode in ("flow", "area") and mode != self.suggest_mode:
+            self.suggest_mode = mode
+            self.suggestions = []
+
     def compute_suggestions(
         self,
         n_candidates: int = DEFAULT_CANDIDATES,
@@ -363,10 +438,12 @@ class Session:
         progress=None,
         should_stop=None,
     ) -> list[Suggestion]:
-        """全エリアについて候補線を計算して返す（self には反映しない。別スレッドから呼べる）。
+        """全エリア（または全人流）について候補線を計算して返す（self には反映しない。別スレッドから呼べる）。
 
-        progress(エリア番号, 評価済み本数, 全本数) で進み具合を通知する。
+        progress(エリア・人流の番号, 評価済み本数, 全本数) で進み具合を通知する。
         """
+        if self.suggest_mode == "flow":
+            return self._compute_flow_suggestions(top_k, progress, should_stop)
         results: list[Suggestion] = []
         for i, area in enumerate(list(self.areas)):
             if should_stop is not None and should_stop():
@@ -395,6 +472,49 @@ class Session:
                 top_k=top_k,
                 progress=area_progress,
             )
+        return results
+
+    def _compute_flow_suggestions(self, top_k: int, progress, should_stop) -> list[Suggestion]:
+        results: list[Suggestion] = []
+        # 線は人流の向きに合わせ、全員が歩く通路（誤判定らしい線は除く）の縁から縁まで引く
+        normal_xy = {t: xy for t, xy in self.tracks_xy.items() if t not in self.suspects}
+        region = walk_mask(normal_xy, self.width, self.height)
+        for i, flow in enumerate(list(self.flows)):
+            if should_stop is not None and should_stop():
+                break
+            if progress is not None:
+                progress(i, 0, 1)
+            candidates = flow_candidates(
+                flow, self.tracks_xy, self.width, self.height, self.fps, self.flow_settings.min_angle, region=region
+            )
+            polygon = region_polygon(region, flow.path, self.width, self.height) or flow.corridor
+
+            def flow_progress(done, total, i=i):
+                if progress is not None:
+                    progress(i, done, total)
+                if should_stop is not None and should_stop():
+                    raise SuggestionCancelled()
+
+            found = suggest_lines(
+                Area(kind="passage", polygon=polygon),
+                -1,
+                self.tracks,
+                self.width,
+                self.height,
+                flow.people,
+                smooth_window=self.smooth,
+                margin=self.margin,
+                fps=self.fps,
+                suspects=self.suspects,
+                repeat_sec=self.repeat_sec,
+                top_k=top_k,
+                progress=flow_progress,
+                candidates=candidates,
+                target_ids=set(flow.track_ids),
+            )
+            for sg in found:
+                sg.flow_index = i
+            results += found
         return results
 
     def adopt_suggestion(self, index: int) -> bool:
@@ -445,8 +565,13 @@ class Session:
         img = self.overlay(all_tracks).copy()
         thick = max(2, round(3 * self.scale))
         if self.show_areas:
-            self.draw_areas(img, highlight=highlight_area)
-            self.draw_suggestions(img, thick, selected=selected_suggestion)
+            if self.suggest_mode == "flow":
+                self.draw_flows(img, highlight=highlight_area)
+                # 人流を選んでいるときは、その人流の候補だけを描く
+                self.draw_suggestions(img, thick, selected=selected_suggestion, only_flow=highlight_area)
+            else:
+                self.draw_areas(img, highlight=highlight_area)
+                self.draw_suggestions(img, thick, selected=selected_suggestion)
         if highlight_track is not None and highlight_track in self.tracks_xy:
             # 一覧で選んだ追跡線を白く太く示す
             pts = np.round(self.tracks_xy[highlight_track]).astype(np.int32)
@@ -506,37 +631,93 @@ class Session:
             labels.append((text, (min(max(top[0] - tw / 2, 2), self.width - tw - 2), max(2, top[1] - th - 10)), size, color))
         put_texts(img, labels)
 
-    def draw_suggestions(self, img: np.ndarray, thick: int, selected: int | None = None) -> None:
-        """カウント線の候補を点線で描く。"""
+    def draw_flows(self, img: np.ndarray, highlight: int | None = None) -> None:
+        """出入口（橙の丸と G 番号）と人流（範囲を薄く塗り、代表経路を矢印付きで描く）。
+
+        highlight を渡すと、その人流だけをはっきり描き、他は薄くする。
+        """
+        size = max(14, round(16 * max(self.scale, 0.9)))
+        width = max(2, round(2 * self.scale))
+        labels = []
+        if self.flows:
+            fill = img.copy()
+            for i, flow in enumerate(self.flows):
+                if len(flow.corridor) >= 3 and (highlight is None or i == highlight):
+                    cv2.fillPoly(fill, [np.round(flow.corridor_points()).astype(np.int32)], flow_color(i))
+            cv2.addWeighted(fill, 0.16, img, 0.84, 0, dst=img)
+        for i, flow in enumerate(self.flows):
+            if highlight is not None and i != highlight:
+                continue
+            color = flow_color(i)
+            pts = np.round(np.array(flow.path)).astype(np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(img, [pts], False, (0, 0, 0), width + 3, cv2.LINE_AA)
+                cv2.polylines(img, [pts], False, color, width + 1, cv2.LINE_AA)
+                # 代表経路の真ん中に、a → b の向きの矢印（帰りの人もいるときは両向き）
+                k = len(pts) // 2
+                tips = [(pts[max(k - 3, 0)], pts[min(k + 3, len(pts) - 1)])]
+                if flow.backward:
+                    tips.append((pts[min(k + 3, len(pts) - 1)], pts[max(k - 3, 0)]))
+                for a, b in tips:
+                    cv2.arrowedLine(img, tuple(int(v) for v in a), tuple(int(v) for v in b), (0, 0, 0), width + 3,
+                                    cv2.LINE_AA, tipLength=0.8)
+                    cv2.arrowedLine(img, tuple(int(v) for v in a), tuple(int(v) for v in b), color, width + 1,
+                                    cv2.LINE_AA, tipLength=0.8)
+                mid = pts[k]
+                labels.append((f"F{i + 1} {flow.label}", (mid[0] + 8, mid[1] + 6), size, color))
+        for g, gw in enumerate(self.gateways):
+            c = (round(gw.x), round(gw.y))
+            r = max(6, round(gw.radius))
+            cv2.circle(img, c, r, (0, 0, 0), width + 2, cv2.LINE_AA)
+            cv2.circle(img, c, r, GATE_COLOR, width, cv2.LINE_AA)
+            text = f"G{g + 1}"
+            tw, th = text_size(text, size)
+            labels.append((text, (min(max(c[0] - tw / 2, 2), self.width - tw - 2), max(2, c[1] - r - th - 6)),
+                           size, GATE_COLOR))
+        put_texts(img, labels)
+
+    def draw_suggestions(
+        self, img: np.ndarray, thick: int, selected: int | None = None, only_flow: int | None = None
+    ) -> None:
+        """カウント線の候補を点線で描く。only_flow を渡すと、その人流の候補（と選んだ候補）だけを描く。"""
         size = max(13, round(14 * max(self.scale, 0.9)))
         labels = []
         for k, sg in enumerate(self.suggestions):
+            if only_flow is not None and sg.flow_index != only_flow and k != selected:
+                continue
             color = SUGGEST_SELECTED if k == selected else SUGGEST_COLOR
             ln = sg.line
             p1, p2 = np.array([ln.x1, ln.y1], float), np.array([ln.x2, ln.y2], float)
             _dashed_line(img, p1, p2, color, thick + (1 if k == selected else 0), dash=max(8, round(12 * self.scale)))
             mid = (p1 + p2) / 2
-            labels.append((f"E{sg.area_index + 1}-{sg.rank}", (mid[0] + 6, mid[1] - size - 4), size, color))
+            labels.append((sg.label, (mid[0] + 6, mid[1] - size - 4), size, color))
         put_texts(img, labels)
 
     def render_suggestions_image(self) -> np.ndarray:
         """保存用: エリアと候補線と各候補の人数。"""
         img = self.overlay(all_tracks=True).copy()
         thick = max(2, round(3 * self.scale))
-        self.draw_areas(img)
+        if self.suggest_mode == "flow":
+            self.draw_flows(img)
+        else:
+            self.draw_areas(img)
         self.draw_suggestions(img, thick)
         rows = []
         for sg in self.suggestions:
-            kind = self.areas[sg.area_index].kind if sg.area_index < len(self.areas) else ""
-            label = self.areas[sg.area_index].kind_label if sg.area_index < len(self.areas) else kind
             rows.append(
                 (
-                    f"E{sg.area_index + 1}-{sg.rank}（{label}）  数えた人 {sg.people}/{sg.area_people}人"
+                    f"{sg.label}（{self.suggestion_place(sg)}）  数えた人 {sg.people}/{sg.area_people}人"
                     f"（{sg.coverage:.0%}）  信頼度 {sg.reliability:.0f}点 {sg.grade}",
                     SUGGEST_COLOR,
                 )
             )
         return self._with_footer(img, rows or [("候補なし", (200, 200, 200))])
+
+    def suggestion_place(self, sg: Suggestion) -> str:
+        """候補がどこのものか（エリアの種類、または人流の出入口）。"""
+        if sg.flow_index >= 0:
+            return self.flows[sg.flow_index].label if sg.flow_index < len(self.flows) else "人流"
+        return self.areas[sg.area_index].kind_label if 0 <= sg.area_index < len(self.areas) else ""
 
     def _with_footer(self, img: np.ndarray, rows: list[tuple[str, tuple[int, int, int]]]) -> np.ndarray:
         size = max(14, round(18 * self.scale))
@@ -570,6 +751,9 @@ class Session:
         self.meta["suspect_ok"] = sorted(self.suspect_ok)
         self.meta["suspect_settings"] = self.suspect_settings.to_dict()
         self.meta["repeat_sec"] = self.repeat_sec
+        self.meta["stitch"] = self.stitch_settings.to_dict()
+        self.meta["suggest_mode"] = self.suggest_mode
+        self.meta["flow_settings"] = self.flow_settings.to_dict()
         self.meta["view"] = {
             "line_width": self.line_width,
             "show_ids": self.show_ids,
@@ -584,9 +768,10 @@ class Session:
         export_lines_json(self.dir / "count_lines.json", self.lines, self.width, self.height, self.video_name)
         save_image(self.dir / "count_result.png", self.render_with_summary())
         save_areas(self.dir / "areas.json", self.areas)
+        save_flows(self.dir / "flows.json", self.gateways, self.flows)
         save_suggestions(self.dir / "suggestions.json", self.suggestions)
         if self.suggestions:
-            save_suggestions_csv(self.dir / "suggestions.csv", self.suggestions, self.areas)
+            save_suggestions_csv(self.dir / "suggestions.csv", self.suggestions, [self.suggestion_place(sg) for sg in self.suggestions])
             save_image(self.dir / "suggestions.png", self.render_suggestions_image())
         else:
             (self.dir / "suggestions.csv").unlink(missing_ok=True)
@@ -631,6 +816,7 @@ def load_suggestions(path: Path) -> list[Suggestion]:
             lower=d.get("lower", 0),
             upper=d.get("upper", 0),
             reasons=d.get("reasons", []),
+            flow_index=d.get("flow_index", -1),
         )
         for d in data.get("suggestions", [])
     ]

@@ -26,13 +26,15 @@ def _fmt_sec(sec: float) -> str:
 
 class BatchDialog(tk.Toplevel):
     def __init__(self, master, models: dict[str, str], default_model: str, line_width: int, open_folder, open_result,
-                 start_queue=None):
+                 start_queue=None, details: dict[str, int] | None = None, default_detail: str | None = None):
         super().__init__(master)
         self.title("一括処理 - 重畳画像をまとめて作成")
         self.geometry("820x600")
         self.minsize(700, 480)
         self.transient(master)
         self.models = models
+        self.details = details or {"標準": 640}
+        self.default_detail = default_detail or next(iter(self.details))
         self.open_folder = open_folder
         self.open_result = open_result  # 結果フォルダをメイン画面で開く関数
         self.start_queue = start_queue  # 出力フォルダの結果を順にカウント線設定する関数
@@ -100,11 +102,18 @@ class BatchDialog(tk.Toplevel):
         self.model_var = tk.StringVar(value=default_model)
         self.model_box = ttk.Combobox(opts, textvariable=self.model_var, values=list(self.models), state="readonly", width=18)
         self.model_box.pack(side=tk.LEFT, padx=(4, 16))
+        ttk.Label(opts, text="細かさ:").pack(side=tk.LEFT)
+        self.detail_var = tk.StringVar(value=self.default_detail)
+        self.detail_box = ttk.Combobox(opts, textvariable=self.detail_var, values=list(self.details), state="readonly",
+                                       width=16)
+        self.detail_box.pack(side=tk.LEFT, padx=(4, 16))
         ttk.Label(opts, text="追跡線の太さ:").pack(side=tk.LEFT)
         self.width_var = tk.IntVar(value=line_width)
         ttk.Spinbox(opts, from_=1, to=15, textvariable=self.width_var, width=4).pack(side=tk.LEFT, padx=(4, 16))
         self.skip_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="解析済みの動画は飛ばす（途中から再開できる）", variable=self.skip_var).pack(side=tk.LEFT)
+        opts2 = ttk.Frame(self)
+        opts2.pack(fill=tk.X, padx=10)
+        ttk.Checkbutton(opts2, text="解析済みの動画は飛ばす（途中から再開できる）", variable=self.skip_var).pack(side=tk.LEFT)
 
         run = ttk.Frame(self)
         run.pack(fill=tk.X, **pad)
@@ -234,6 +243,7 @@ class BatchDialog(tk.Toplevel):
             width = 1
         items = list(self.items)
         model = self.models[self.model_var.get()]
+        imgsz = self.details.get(self.detail_var.get(), 640)
         skip = self.skip_var.get()
         self.stop_event = threading.Event()
         stop = self.stop_event
@@ -255,6 +265,7 @@ class BatchDialog(tk.Toplevel):
                     items,
                     out,
                     model_name=model,
+                    imgsz=imgsz,
                     line_width=width,
                     skip_done=skip,
                     progress=progress,
@@ -342,6 +353,7 @@ class BatchDialog(tk.Toplevel):
                   self.btn_to_queue):
             w.config(state=state)
         self.model_box.config(state=tk.DISABLED if running else "readonly")
+        self.detail_box.config(state=tk.DISABLED if running else "readonly")
         self.btn_stop.config(state=tk.NORMAL if running else tk.DISABLED)
 
     def on_close(self) -> None:

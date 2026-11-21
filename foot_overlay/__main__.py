@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .counting import parse_line_arg
 from .drawing import filter_short_tracks
+from .stitch import KEEP_MIN_POINTS
 from .session import Session, write_result
 from .tracking import track_video
 
@@ -54,6 +55,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="アプリで書き出したカウント線の JSON を読み込んで数える（画像の大きさが違えば座標を合わせる）",
     )
     p.add_argument(
+        "--suggest-mode",
+        choices=["flow", "area"],
+        default="flow",
+        help="候補線の探し方: flow = 出入口と人流から（既定。見つからなければ area）、area = エリアごと",
+    )
+    p.add_argument(
         "--restart",
         action="store_true",
         help="前回途中で止まった解析があっても、続きからではなく最初から解析し直す",
@@ -90,14 +97,17 @@ def process_video(video: Path, args: argparse.Namespace) -> Path:
     )
     if result.resumed_from:
         print(f"  前回の続き（{result.resumed_from}フレーム目）から再開しました")
-    tracks = filter_short_tracks(result.tracks, args.min_points)
+    # 短い切れ端も残して保存する（開くときに途切れた線をつないでから、min_points 未満の線を除く）
+    tracks = filter_short_tracks(result.tracks, min(KEEP_MIN_POINTS, args.min_points))
     view = {"line_width": args.line_width, "show_ids": not args.no_ids, "grid": args.grid, "dim": args.dim}
     write_result(out_dir, video, result, tracks, smooth=args.smooth, min_points=args.min_points, view=view)
-    Session(out_dir).save()  # overlay.png を描く
+    session = Session(out_dir)
+    session.save()  # overlay.png を描く
 
     h, w = result.first_frame.shape[:2]
     print(f"  動画: {w}x{h}, {result.fps:.1f}fps, {result.total_frames}フレーム（全フレーム解析）")
-    print(f"  追跡ID: {len(result.tracks)}件 → 描画: {len(tracks)}件（{args.min_points}回未満の短いIDを除外）")
+    joined = f"、途切れた線を {session.stitched} か所つないだ" if session.stitched else ""
+    print(f"  追跡ID: {len(result.tracks)}件 → 描画: {len(session.tracks)}件（{args.min_points}回未満の短いIDを除外{joined}）")
     print(f"  処理時間: {time.time() - started:.0f}秒")
     print(f"  出力先: {out_dir}")
     return out_dir
@@ -114,22 +124,42 @@ def count_with_lines(result_dir: Path, line_args: list[str], args: argparse.Name
         print(f"  {text}")
 
 
-def suggest(result_dir: Path, n_candidates: int) -> None:
+def suggest(result_dir: Path, n_candidates: int, mode: str = "flow") -> None:
     session = Session(result_dir)
-    if not session.areas:
+    session.set_suggest_mode(mode)
+    if mode == "flow":
+        if not session.flows:
+            session.detect_flows()
+        if not session.flows:
+            print("\n  人流が見つからなかったので（出入口どうしを歩いた人が少ないため）、エリアごとに探します")
+            session.set_suggest_mode("area")
+    if session.suggest_mode == "area" and not session.areas:
         session.auto_detect_areas()
-    print(f"\n▶ カウント線の候補（{result_dir.name}・エリア{len(session.areas)}件・各最大{n_candidates}本を評価）")
+    if session.suggest_mode == "flow":
+        gates = "、".join(f"G{i + 1}({g.x:.0f},{g.y:.0f})" for i, g in enumerate(session.gateways))
+        print(f"\n▶ カウント線の候補（{result_dir.name}・出入口と人流から・人流と{session.flow_settings.min_angle:.0f}°以上で交わる線）")
+        print(f"  出入口: {gates}")
+    else:
+        print(f"\n▶ カウント線の候補（{result_dir.name}・エリア{len(session.areas)}件・各最大{n_candidates}本を評価）")
     if session.suspects:
         print(f"  誤判定らしい追跡線 {len(session.suspects)}本（ID: {', '.join(map(str, sorted(session.suspects)))}）が通らない位置に引きます")
     session.suggestions = session.compute_suggestions(n_candidates=n_candidates)
     session.save()
-    for i, area in enumerate(session.areas):
-        print(f"  E{i + 1}（{area.kind_label}）: エリアを通った人 {session.area_people(i)}人")
-        for sg in [s for s in session.suggestions if s.area_index == i]:
+    if session.suggest_mode == "flow":
+        groups = [(f"F{i + 1}（{f.label}）: 人流の人 {f.people}人", i, "flow_index") for i, f in enumerate(session.flows)]
+    else:
+        groups = [(f"E{i + 1}（{a.kind_label}）: エリアを通った人 {session.area_people(i)}人", i, "area_index")
+                  for i, a in enumerate(session.areas)]
+    for title, i, key in groups:
+        print(f"  {title}")
+        for sg in [s for s in session.suggestions if getattr(s, key) == i]:
             ln = sg.line
+            if key == "flow_index":
+                detail = f"人流の人 {sg.people}人を数える（{sg.coverage:.0%}）  線を通る全員: 推定 {sg.lower}〜{sg.upper}回"
+            else:
+                detail = f"人数 {sg.people}人（{sg.coverage:.0%}） 通過 {sg.passes}回（推定 {sg.lower}〜{sg.upper}回）"
             print(
-                f"    候補{sg.rank}: ({ln.x1:.0f},{ln.y1:.0f})-({ln.x2:.0f},{ln.y2:.0f})"
-                f"  人数 {sg.people}人（{sg.coverage:.0%}） 通過 {sg.passes}回（推定 {sg.lower}〜{sg.upper}回）"
+                f"    候補{sg.rank}: ({ln.x1:.0f},{ln.y1:.0f})-({ln.x2:.0f},{ln.y2:.0f})  {detail}"
                 f" 信頼度 {sg.reliability:.0f}点 {sg.grade}"
             )
     print(f"  保存先: {result_dir / 'suggestions.png'}")
@@ -153,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
                 failed += 1
                 continue
             if args.suggest:
-                suggest(path, args.suggest)
+                suggest(path, args.suggest, args.suggest_mode)
             if args.line:
                 count_with_lines(path, args.line, args)
             if args.lines_json:
